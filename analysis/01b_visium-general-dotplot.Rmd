@@ -1,0 +1,951 @@
+---
+title: "10X Visium analysis - regional marker dotplot"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+### GLOBAL REGIONAL MARKER DOT PLOT
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+output_dir <- "01_6_global regional marker dot plot"
+
+dir.create(
+  output_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+```
+
+
+```{r}
+### SETTINGS
+
+top_markers_per_region <- 2L
+
+marker_min_pct <- 0.10
+marker_log2fc_cutoff <- 0.25
+marker_min_pct_difference <- 0.10
+```
+
+
+```{r}
+### PREPARE OBJECT
+
+DefaultAssay(
+  experiment
+) <- "Spatial"
+
+
+cells_use <- rownames(
+  experiment@meta.data
+)[
+  !is.na(
+    experiment$labels
+  ) &
+    experiment$labels != "n/a"
+]
+
+
+experiment_regions <- subset(
+  experiment,
+  cells = cells_use
+)
+
+
+### Preserve the existing anatomical-region order when labels
+### are already stored as a factor.
+
+if (
+  is.factor(
+    experiment_regions$labels
+  )
+) {
+
+  region_order <- levels(
+    droplevels(
+      experiment_regions$labels
+    )
+  )
+
+} else {
+
+  region_order <- unique(
+    as.character(
+      experiment_regions$labels
+    )
+  )
+}
+
+
+experiment_regions$labels <- factor(
+  experiment_regions$labels,
+  levels = region_order
+)
+
+
+Idents(
+  experiment_regions
+) <- "labels"
+
+```
+
+
+```{r}
+### REGION-VERSUS-REST MARKER ANALYSIS
+
+region_markers <- FindAllMarkers(
+  object = experiment_regions,
+
+  assay = "Spatial",
+
+  only.pos = TRUE,
+
+  test.use = "wilcox",
+
+  min.pct = marker_min_pct,
+
+  logfc.threshold =
+    marker_log2fc_cutoff,
+
+  return.thresh = 1,
+
+  verbose = TRUE
+)
+```
+
+
+```{r}
+### RANK MARKERS BY REGIONAL SEPARATION
+
+region_markers_ranked <- region_markers %>%
+  mutate(
+    region = as.character(
+      cluster
+    ),
+
+    pct_difference =
+      pct.1 - pct.2,
+
+    marker_score =
+      avg_log2FC *
+      pct_difference
+  ) %>%
+
+  filter(
+    !is.na(
+      p_val_adj
+    ),
+
+    p_val_adj < 0.05,
+
+    avg_log2FC >
+      marker_log2fc_cutoff,
+
+    pct.1 >=
+      marker_min_pct,
+
+    pct_difference >=
+      marker_min_pct_difference,
+
+    !grepl(
+      pattern = "^(mt-|Rpl|Rps)",
+      x = gene
+    )
+  ) %>%
+
+  mutate(
+    region = factor(
+      region,
+      levels = region_order
+    )
+  ) %>%
+
+  arrange(
+    region,
+    desc(
+      marker_score
+    ),
+    desc(
+      avg_log2FC
+    ),
+    desc(
+      pct_difference
+    )
+  )
+```
+
+
+```{r}
+### SELECT DISTINCT TOP MARKERS
+
+# A gene is used only once in the plot, even if it ranks
+# highly for more than one anatomical region.
+
+selected_marker_list <- vector(
+  mode = "list",
+  length = length(
+    region_order
+  )
+)
+
+
+used_genes <- character()
+
+
+for (
+  region_index in seq_along(
+    region_order
+  )
+) {
+
+  current_region <-
+    region_order[
+      region_index
+    ]
+
+
+  current_candidates <-
+    region_markers_ranked %>%
+    filter(
+      as.character(
+        region
+      ) == current_region,
+
+      !gene %in%
+        used_genes
+    ) %>%
+
+    slice_head(
+      n = top_markers_per_region
+    )
+
+
+  selected_marker_list[[
+    region_index
+  ]] <- current_candidates
+
+
+  used_genes <- c(
+    used_genes,
+    current_candidates$gene
+  )
+}
+
+
+top_region_markers <- bind_rows(
+  selected_marker_list
+) %>%
+  mutate(
+    region = factor(
+      region,
+      levels = region_order
+    )
+  ) %>%
+  arrange(
+    region,
+    desc(
+      marker_score
+    )
+  )
+
+
+write.csv(
+  top_region_markers,
+  file.path(
+    output_dir,
+    "top_region_separating_markers.csv"
+  ),
+  row.names = FALSE
+)
+
+
+# Check whether every region obtained the requested number.
+
+marker_count_by_region <- top_region_markers %>%
+  dplyr::count(
+    region,
+    name = "n_selected_markers"
+  )
+
+
+print(
+  marker_count_by_region,
+  row.names = FALSE
+)
+
+```
+
+```{r}
+### CLUSTER REGIONS BY SELECTED-MARKER EXPRESSION
+
+# Use the same selected markers that will be shown in the
+# final dot plot.
+
+selected_marker_genes <- unique(
+  top_region_markers$gene
+)
+
+
+# Obtain scaled average expression for every selected marker
+# in every anatomical region.
+
+marker_clustering_data <- Seurat::DotPlot(
+  object = experiment_regions,
+
+  features = selected_marker_genes,
+
+  assay = "Spatial",
+
+  group.by = "labels",
+
+  scale = TRUE
+)$data %>%
+
+  dplyr::transmute(
+    region = as.character(
+      id
+    ),
+
+    gene = as.character(
+      features.plot
+    ),
+
+    scaled_average_expression =
+      avg.exp.scaled
+  ) %>%
+
+  tidyr::pivot_wider(
+    names_from = gene,
+    values_from = scaled_average_expression
+  )
+
+
+# Convert to a region × marker matrix.
+
+marker_clustering_matrix <- as.data.frame(
+  marker_clustering_data
+)
+
+
+rownames(
+  marker_clustering_matrix
+) <- marker_clustering_matrix$region
+
+
+marker_clustering_matrix$region <- NULL
+
+
+marker_clustering_matrix <- as.matrix(
+  marker_clustering_matrix
+)
+
+
+# Ensure that all annotated regions are represented.
+
+missing_clustering_regions <- setdiff(
+  region_order,
+  rownames(
+    marker_clustering_matrix
+  )
+)
+
+
+if (
+  length(
+    missing_clustering_regions
+  ) > 0
+) {
+
+  stop(
+    paste0(
+      "The marker-expression matrix is missing these regions: ",
+      paste(
+        missing_clustering_regions,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+
+# Start from the complete original region set.
+
+marker_clustering_matrix <-
+  marker_clustering_matrix[
+    region_order,
+    ,
+    drop = FALSE
+  ]
+
+
+# Remove marker columns containing non-finite scaled values.
+
+finite_marker_columns <- apply(
+  marker_clustering_matrix,
+  2,
+  function(x) {
+    all(
+      is.finite(
+        x
+      )
+    )
+  }
+)
+
+
+if (
+  any(
+    !finite_marker_columns
+  )
+) {
+
+  warning(
+    paste0(
+      "Removing ",
+      sum(
+        !finite_marker_columns
+      ),
+      " marker genes with non-finite scaled expression values."
+    )
+  )
+
+
+  marker_clustering_matrix <-
+    marker_clustering_matrix[
+      ,
+      finite_marker_columns,
+      drop = FALSE
+    ]
+}
+
+
+if (
+  ncol(
+    marker_clustering_matrix
+  ) < 2
+) {
+
+  stop(
+    "Too few marker genes remain for regional clustering."
+  )
+}
+
+
+# Cluster regions using their scaled expression profiles
+# across all selected markers.
+
+region_marker_distance <- stats::dist(
+  marker_clustering_matrix,
+  method = "euclidean"
+)
+
+
+region_marker_hclust <- stats::hclust(
+  region_marker_distance,
+  method = "average"
+)
+
+
+region_order_clustered <- rownames(
+  marker_clustering_matrix
+)[
+  region_marker_hclust$order
+]
+
+
+# Save the resulting order for documentation.
+
+write.csv(
+  data.frame(
+    plot_position = seq_along(
+      region_order_clustered
+    ),
+
+    region =
+      region_order_clustered
+  ),
+
+  file.path(
+    output_dir,
+    "anatomical_region_marker_clustered_order.csv"
+  ),
+
+  row.names = FALSE
+)
+
+
+print(
+  data.frame(
+    plot_position = seq_along(
+      region_order_clustered
+    ),
+
+    region =
+      region_order_clustered
+  ),
+
+  row.names = FALSE
+)
+
+
+# Apply the same order to the regional identities shown on
+# the dot-plot y-axis.
+
+experiment_regions$labels <- factor(
+  as.character(
+    experiment_regions$labels
+  ),
+  levels = region_order_clustered
+)
+
+
+Idents(
+  experiment_regions
+) <- "labels"
+```
+
+
+```{r}
+### CONSTRUCT CLUSTER-ORDERED FEATURE LIST
+
+# Order the marker blocks according to the clustered regional
+# order. Within each block, retain the marker-score ranking.
+
+top_region_markers_plot <- top_region_markers %>%
+  mutate(
+    region = factor(
+      as.character(
+        region
+      ),
+      levels = region_order_clustered
+    )
+  ) %>%
+
+  arrange(
+    region,
+    desc(
+      marker_score
+    )
+  )
+
+
+marker_feature_list <- split(
+  top_region_markers_plot$gene,
+  top_region_markers_plot$region,
+  drop = TRUE
+)
+
+
+### Explicitly enforce the same order as the region identities.
+
+marker_feature_list <-
+  marker_feature_list[
+    region_order_clustered[
+      region_order_clustered %in%
+        names(
+          marker_feature_list
+        )
+    ]
+  ]
+
+```
+
+```{r}
+### GENERATE REGIONAL MARKER DOT PLOT
+
+
+# Prepare marker order
+
+marker_order_table <- top_region_markers %>%
+  mutate(
+    region = as.character(
+      region
+    )
+  ) %>%
+
+  arrange(
+    factor(
+      region,
+      levels = region_order
+    ),
+    desc(
+      marker_score
+    )
+  ) %>%
+
+  distinct(
+    gene,
+    .keep_all = TRUE
+  ) %>%
+
+  mutate(
+    marker_region = factor(
+      region,
+      levels = region_order
+    )
+  )
+
+
+marker_genes <- marker_order_table$gene
+
+
+
+# Extract Seurat dotplot data
+
+regional_marker_plot_data <- Seurat::DotPlot(
+  object = experiment_regions,
+
+  features = marker_genes,
+
+  assay = "Spatial",
+
+  group.by = "labels",
+
+  scale = TRUE
+)$data %>%
+
+  transmute(
+    region = as.character(
+      id
+    ),
+
+    gene = as.character(
+      features.plot
+    ),
+
+    percent_expressed =
+      pct.exp,
+
+    average_expression_scaled =
+      avg.exp.scaled
+  ) %>%
+
+  left_join(
+    marker_order_table %>%
+      dplyr::select(
+        gene,
+        marker_region,
+        marker_score
+      ),
+
+    by = "gene"
+  ) %>%
+
+  mutate(
+    region = factor(
+      region,
+      levels = region_order
+    ),
+
+    marker_region = factor(
+      as.character(
+        marker_region
+      ),
+      levels = region_order
+    ),
+
+    gene = factor(
+      gene,
+      levels = rev(
+        marker_genes
+      )
+    )
+  )
+
+
+
+# Split marker groups into two balanced panels
+
+split_position <- ceiling(
+  length(
+    region_order
+  ) / 2
+)
+
+
+marker_region_sets <- list(
+  region_order[
+    seq_len(
+      split_position
+    )
+  ],
+
+  region_order[
+    seq.int(
+      split_position + 1,
+      length(
+        region_order
+      )
+    )
+  ]
+)
+
+
+
+# Panel function
+
+make_regional_marker_panel <- function(
+  marker_regions
+) {
+
+  current_plot_data <- regional_marker_plot_data %>%
+    filter(
+      as.character(
+        marker_region
+      ) %in% marker_regions
+    ) %>%
+
+    mutate(
+      marker_region = factor(
+        as.character(
+          marker_region
+        ),
+        levels = marker_regions
+      )
+    )
+
+
+  ggplot(
+    current_plot_data,
+    aes(
+      x = region,
+      y = gene
+    )
+  ) +
+
+    geom_point(
+      aes(
+        size = percent_expressed,
+        colour = average_expression_scaled
+      )
+    ) +
+
+    facet_grid(
+      rows = vars(
+        marker_region
+      ),
+
+      scales = "free_y",
+      space = "free_y",
+      switch = "y"
+    ) +
+
+    scale_x_discrete(
+      drop = FALSE
+    ) +
+
+    scale_size_continuous(
+      name = "Percent\nexpressed",
+
+      limits = c(
+        0,
+        100
+      ),
+
+      breaks = c(
+        0,
+        25,
+        50,
+        75,
+        100
+      ),
+
+      range = c(
+        0,
+        5
+      )
+    ) +
+
+    scale_colour_gradient(
+      name = "Scaled average\nexpression",
+
+      low = "grey92",
+      high = "#b2182b",
+
+      limits = c(
+        -1,
+        2
+      ),
+
+      breaks = c(
+        -1,
+        0,
+        1,
+        2
+      ),
+
+      oob = scales::squish
+    ) +
+
+    labs(
+      x = NULL,
+      y = NULL
+    ) +
+
+    theme_bw() +
+
+    theme(
+      panel.grid =
+        element_blank(),
+
+      panel.border =
+        element_rect(
+          colour = "grey80",
+          linewidth = 0.3
+        ),
+
+      panel.spacing.y =
+        grid::unit(
+          0.08,
+          "lines"
+        ),
+
+      strip.placement =
+        "outside",
+
+      strip.background =
+        element_rect(
+          fill = "grey92",
+          colour = "grey60",
+          linewidth = 0.3
+        ),
+
+      strip.text.y =
+        element_text(
+          angle = 0,
+          face = "bold",
+          size = 7
+        ),
+
+      strip.text.y.left =
+        element_text(
+          angle = 0,
+          face = "bold",
+          size = 7
+        ),
+
+      axis.text.x =
+        element_text(
+          angle = 45,
+          hjust = 1,
+          vjust = 1,
+          size = 7
+        ),
+
+      axis.text.y =
+        element_text(
+          face = "italic",
+          size = 7
+        ),
+
+      axis.ticks =
+        element_blank(),
+
+      legend.position =
+        "right"
+    )
+}
+
+
+
+# Generate and combine panels
+
+regional_marker_panel_1 <-
+  make_regional_marker_panel(
+    marker_region_sets[[1]]
+  )
+
+
+regional_marker_panel_2 <-
+  make_regional_marker_panel(
+    marker_region_sets[[2]]
+  )
+
+
+regional_marker_dotplot <-
+  regional_marker_panel_1 +
+  regional_marker_panel_2 +
+
+  patchwork::plot_layout(
+    guides = "collect",
+    widths = c(
+      1,
+      1
+    )
+  ) +
+
+  patchwork::plot_annotation(
+    title =
+      "Transcriptional markers distinguishing anatomical regions",
+
+    subtitle = paste0(
+      "Top ",
+      top_markers_per_region,
+      " positive region-versus-rest markers per region"
+    ),
+
+    theme = theme(
+      plot.title = element_text(
+        face = "bold",
+        size = 15
+      ),
+
+      plot.subtitle = element_text(
+        size = 10
+      )
+    )
+  )
+
+
+regional_marker_dotplot <-
+  regional_marker_dotplot &
+  theme(
+    legend.position = "right"
+  )
+
+
+regional_marker_dotplot
+
+
+
+# Save
+
+ggsave(
+  filename = file.path(
+    output_dir,
+    "global_anatomical_region_marker_dotplot_optimized.pdf"
+  ),
+
+  plot = regional_marker_dotplot,
+
+  device = cairo_pdf,
+
+  width = 18,
+  height = 12.5,
+  units = "in"
+)
+
+
+ggsave(
+  filename = file.path(
+    output_dir,
+    "global_anatomical_region_marker_dotplot_optimized.png"
+  ),
+
+  plot = regional_marker_dotplot,
+
+  width = 18,
+  height = 12.5,
+  units = "in",
+
+  dpi = 300
+)
+```
+

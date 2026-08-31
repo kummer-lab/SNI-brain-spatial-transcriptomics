@@ -1,0 +1,711 @@
+---
+title: "10X Visium - cross region similarity"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(pheatmap)
+
+# Requires `deg_table_all` generated in 02_visium_DEG.Rmd.
+```
+
+```{r}
+### SETUP
+
+output_dir <- "04_regional_transcriptional_similarity"
+
+dir.create(
+  output_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+
+target_regions <- c(
+  "dSTRr",
+  "NAS",
+  "PIRc",
+  "dSTRc",
+  "S1c"
+)
+
+
+# Expression filter for the Spearman analysis
+
+minimum_pct <- 0.10
+minimum_regions_expressed <- 2L
+
+
+# DEG definition for the Jaccard analysis
+
+adjusted_p_cutoff <- 0.05
+absolute_log2fc_cutoff <- 0.25
+
+
+# Hierarchical clustering method
+
+clustering_method <- "average"
+```
+
+```{r}
+### CHECK REQUIRED COLUMNS
+
+required_columns <- c(
+  "gene",
+  "region",
+  "avg_log2FC",
+  "pct.1",
+  "pct.2",
+  "p_val_adj"
+)
+
+
+missing_columns <- setdiff(
+  required_columns,
+  colnames(deg_table_all)
+)
+
+
+if (length(missing_columns) > 0) {
+
+  stop(
+    paste0(
+      "deg_table_all is missing the following columns: ",
+      paste(
+        missing_columns,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+
+missing_regions <- setdiff(
+  target_regions,
+  unique(
+    as.character(
+      deg_table_all$region
+    )
+  )
+)
+
+
+if (length(missing_regions) > 0) {
+
+  stop(
+    paste0(
+      "The following target regions are absent from deg_table_all: ",
+      paste(
+        missing_regions,
+        collapse = ", "
+      )
+    )
+  )
+}
+```
+
+```{r}
+### PREPARE ONE ROW PER GENE AND REGION
+
+deg_similarity <- deg_table_all %>%
+  dplyr::mutate(
+    gene = trimws(
+      as.character(gene)
+    ),
+    region = as.character(region),
+    avg_log2FC = as.numeric(avg_log2FC),
+    pct.1 = as.numeric(pct.1),
+    pct.2 = as.numeric(pct.2),
+    p_val_adj = as.numeric(p_val_adj)
+  ) %>%
+  dplyr::filter(
+    region %in% target_regions,
+    !is.na(gene),
+    gene != ""
+  ) %>%
+
+  # If duplicate gene-region rows exist, retain the row with
+  # the smallest adjusted p-value.
+
+  dplyr::group_by(
+    gene,
+    region
+  ) %>%
+  dplyr::arrange(
+    is.na(p_val_adj),
+    p_val_adj,
+    .by_group = TRUE
+  ) %>%
+  dplyr::slice_head(
+    n = 1
+  ) %>%
+  dplyr::ungroup() %>%
+
+  dplyr::mutate(
+    maximum_pct = dplyr::case_when(
+      is.na(pct.1) & is.na(pct.2) ~ NA_real_,
+      TRUE ~ pmax(
+        pct.1,
+        pct.2,
+        na.rm = TRUE
+      )
+    ),
+    sufficiently_expressed =
+      !is.na(maximum_pct) &
+      maximum_pct >= minimum_pct,
+
+    significant_deg =
+      !is.na(p_val_adj) &
+      p_val_adj < adjusted_p_cutoff &
+      abs(avg_log2FC) > absolute_log2fc_cutoff,
+
+    direction = dplyr::case_when(
+      significant_deg & avg_log2FC > 0 ~ "up",
+      significant_deg & avg_log2FC < 0 ~ "down",
+      TRUE                             ~ NA_character_
+    )
+  )
+
+```
+
+```{r}
+### SPEARMAN ANALYSIS: SELECT GENES SUITABLE FOR REGIONAL COMPARISON
+
+eligible_genes <- deg_similarity %>%
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(
+    n_regions_expressed = sum(
+      sufficiently_expressed,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(
+    n_regions_expressed >= minimum_regions_expressed
+  ) %>%
+  dplyr::pull(gene)
+
+
+cat(
+  "Genes retained for Spearman analysis:",
+  length(eligible_genes),
+  "\n"
+)
+
+
+if (length(eligible_genes) < 2) {
+
+  stop(
+    "Fewer than two genes passed the expression filter."
+  )
+}
+```
+
+```{r}
+### CONSTRUCT GENE-BY-REGION LOG2FC MATRIX
+
+fc_table <- deg_similarity %>%
+  dplyr::filter(
+    gene %in% eligible_genes
+  ) %>%
+  dplyr::select(
+    gene,
+    region,
+    avg_log2FC
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = region,
+    values_from = avg_log2FC
+  )
+
+
+fc_matrix <- fc_table %>%
+  tibble::column_to_rownames("gene") %>%
+  as.matrix()
+
+
+fc_matrix <- fc_matrix[
+  ,
+  target_regions,
+  drop = FALSE
+]
+
+
+# Retain genes with finite values in at least two regions
+
+fc_matrix <- fc_matrix[
+  rowSums(
+    is.finite(fc_matrix)
+  ) >= 2,
+  ,
+  drop = FALSE
+]
+
+
+utils::write.csv(
+  data.frame(
+    gene = rownames(fc_matrix),
+    fc_matrix,
+    check.names = FALSE
+  ),
+  file.path(
+    output_dir,
+    "regional_gene_log2FC_matrix.csv"
+  ),
+  row.names = FALSE
+)
+
+```
+
+```{r}
+### SPEARMAN CORRELATION MATRIX
+
+spearman_matrix <- stats::cor(
+  fc_matrix,
+  method = "spearman",
+  use = "pairwise.complete.obs"
+)
+
+
+if (any(!is.finite(spearman_matrix))) {
+
+  stop(
+    "The Spearman correlation matrix contains non-finite values."
+  )
+}
+
+
+utils::write.csv(
+  spearman_matrix,
+  file.path(
+    output_dir,
+    "regional_log2FC_Spearman_matrix.csv"
+  ),
+  row.names = TRUE
+)
+
+```
+
+```{r}
+### INDEPENDENT HIERARCHICAL CLUSTERING: SPEARMAN MATRIX
+
+spearman_distance <- stats::as.dist(
+  1 - spearman_matrix
+)
+
+
+spearman_hclust <- stats::hclust(
+  spearman_distance,
+  method = clustering_method
+)
+
+```
+
+```{r}
+### FIGURE: CLUSTERED SPEARMAN CORRELATION HEATMAP
+
+# Keep the original matrix unchanged for clustering.
+# Remove the uninformative diagonal only from the plotted matrix.
+
+spearman_plot_matrix <- spearman_matrix
+
+diag(
+  spearman_plot_matrix
+) <- NA_real_
+
+
+# Fixed symmetric scale around zero.
+# Observed off-diagonal correlations range approximately
+# from 0.14 to 0.35.
+
+spearman_colour_limit <- 0.50
+
+
+spearman_colours <- grDevices::colorRampPalette(
+  c(
+    "#2166ac",
+    "white",
+    "#b2182b"
+  )
+)(
+  100
+)
+
+
+spearman_breaks <- seq(
+  -spearman_colour_limit,
+  spearman_colour_limit,
+  length.out = 101
+)
+
+
+# Create the displayed values separately so that the
+# diagonal can remain blank.
+
+spearman_number_matrix <- matrix(
+  sprintf(
+    "%.2f",
+    spearman_matrix
+  ),
+  nrow = nrow(
+    spearman_matrix
+  ),
+  ncol = ncol(
+    spearman_matrix
+  ),
+  dimnames = dimnames(
+    spearman_matrix
+  )
+)
+
+
+diag(
+  spearman_number_matrix
+) <- ""
+
+
+grDevices::pdf(
+  file.path(
+    output_dir,
+    "regional_log2FC_Spearman_clustered_heatmap.pdf"
+  ),
+  width = 7,
+  height = 6
+)
+
+
+pheatmap::pheatmap(
+  spearman_plot_matrix,
+
+  cluster_rows = spearman_hclust,
+  cluster_cols = spearman_hclust,
+
+  color = spearman_colours,
+  breaks = spearman_breaks,
+
+  na_col = "grey90",
+
+  display_numbers = spearman_number_matrix,
+
+  border_color = "white",
+
+  fontsize = 11,
+  fontsize_number = 10,
+
+  main = paste0(
+    "Regional transcriptional-response similarity\n",
+    "Spearman correlation of gene-wise log2FC profiles"
+  ),
+
+  legend = TRUE
+)
+
+
+grDevices::dev.off()
+```
+
+```{r}
+### CONSTRUCT SIGNED DEG SETS FOR JACCARD ANALYSIS
+
+# Each gene-direction combination is treated as a separate element.
+# Examples: "Snap25__up" and "Snap25__down"
+# A gene therefore contributes to the intersection only when it
+# is significantly regulated in the same direction in both regions.
+
+signed_deg_sets <- deg_similarity %>%
+  dplyr::filter(
+    significant_deg,
+    !is.na(direction)
+  ) %>%
+  dplyr::mutate(
+    signed_gene = paste(
+      gene,
+      direction,
+      sep = "__"
+    )
+  ) %>%
+  dplyr::group_by(region) %>%
+  dplyr::summarise(
+    signed_genes = list(
+      unique(signed_gene)
+    ),
+    n_signed_degs = dplyr::n_distinct(
+      signed_gene
+    ),
+    .groups = "drop"
+  )
+
+
+missing_jaccard_regions <- setdiff(
+  target_regions,
+  signed_deg_sets$region
+)
+
+
+if (length(missing_jaccard_regions) > 0) {
+
+  stop(
+    paste0(
+      "No significant signed DEGs were found for: ",
+      paste(
+        missing_jaccard_regions,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+
+signed_deg_sets <- signed_deg_sets %>%
+  dplyr::mutate(
+    region = factor(
+      region,
+      levels = target_regions
+    )
+  ) %>%
+  dplyr::arrange(region)
+
+
+utils::write.csv(
+  signed_deg_sets %>%
+    dplyr::select(
+      region,
+      n_signed_degs
+    ),
+  file.path(
+    output_dir,
+    "regional_signed_DEG_counts.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+### DIRECTION-CONCORDANT JACCARD MATRIX
+
+jaccard_matrix <- matrix(
+  NA_real_,
+  nrow = length(target_regions),
+  ncol = length(target_regions),
+  dimnames = list(
+    target_regions,
+    target_regions
+  )
+)
+
+
+for (region_1 in target_regions) {
+
+  genes_1 <- signed_deg_sets %>%
+    dplyr::filter(
+      as.character(region) == region_1
+    ) %>%
+    dplyr::pull(signed_genes)
+
+
+  genes_1 <- genes_1[[1]]
+
+
+  for (region_2 in target_regions) {
+
+    genes_2 <- signed_deg_sets %>%
+      dplyr::filter(
+        as.character(region) == region_2
+      ) %>%
+      dplyr::pull(signed_genes)
+
+
+    genes_2 <- genes_2[[1]]
+
+
+    union_genes <- union(
+      genes_1,
+      genes_2
+    )
+
+
+    if (length(union_genes) == 0) {
+
+      jaccard_matrix[
+        region_1,
+        region_2
+      ] <- NA_real_
+
+    } else {
+
+      jaccard_matrix[
+        region_1,
+        region_2
+      ] <- length(
+        intersect(
+          genes_1,
+          genes_2
+        )
+      ) / length(
+        union_genes
+      )
+    }
+  }
+}
+
+
+if (any(!is.finite(jaccard_matrix))) {
+
+  stop(
+    "The direction-concordant Jaccard matrix contains non-finite values."
+  )
+}
+
+
+utils::write.csv(
+  jaccard_matrix,
+  file.path(
+    output_dir,
+    "regional_direction_concordant_DEG_Jaccard_matrix.csv"
+  ),
+  row.names = TRUE
+)
+
+
+```
+
+```{r}
+### INDEPENDENT HIERARCHICAL CLUSTERING: JACCARD MATRIX
+
+jaccard_distance <- stats::as.dist(
+  1 - jaccard_matrix
+)
+
+
+jaccard_hclust <- stats::hclust(
+  jaccard_distance,
+  method = clustering_method
+)
+```
+
+```{r}
+### FIGURE: CLUSTERED DIRECTION-CONCORDANT JACCARD HEATMAP
+
+# Use a separate matrix for plotting so the original matrix,
+# including its diagonal, remains unchanged.
+
+jaccard_plot_matrix <- jaccard_matrix
+
+
+# The diagonal is always 1 and contains no comparative
+# information. Display it in grey rather than allowing it to
+# determine the color scale.
+
+diag(
+  jaccard_plot_matrix
+) <- NA_real_
+
+
+# Determine the largest observed off-diagonal Jaccard value.
+
+jaccard_max <- max(
+  jaccard_plot_matrix,
+  na.rm = TRUE
+)
+
+
+# Round the upper color limit up to the next 0.05.
+# For example, a maximum of 0.23 gives a scale from 0 to 0.25.
+
+jaccard_colour_max <- max(
+  0.05,
+  ceiling(
+    jaccard_max / 0.05
+  ) * 0.05
+)
+
+
+jaccard_breaks <- seq(
+  0,
+  jaccard_colour_max,
+  length.out = 101
+)
+
+
+jaccard_colours <- grDevices::colorRampPalette(
+  c(
+    "white",
+    "#fcbba1",
+    "#67000d"
+  )
+)(
+  100
+)
+
+
+# Use a character matrix so the diagonal can be left blank.
+
+jaccard_number_matrix <- matrix(
+  sprintf(
+    "%.2f",
+    jaccard_matrix
+  ),
+  nrow = nrow(
+    jaccard_matrix
+  ),
+  ncol = ncol(
+    jaccard_matrix
+  ),
+  dimnames = dimnames(
+    jaccard_matrix
+  )
+)
+
+
+diag(
+  jaccard_number_matrix
+) <- ""
+
+
+grDevices::pdf(
+  file.path(
+    output_dir,
+    "regional_direction_concordant_DEG_Jaccard_clustered_heatmap.pdf"
+  ),
+  width = 7,
+  height = 6
+)
+
+
+pheatmap::pheatmap(
+  jaccard_plot_matrix,
+
+  cluster_rows = jaccard_hclust,
+  cluster_cols = jaccard_hclust,
+
+  color = jaccard_colours,
+  breaks = jaccard_breaks,
+
+  na_col = "grey90",
+
+  display_numbers = jaccard_number_matrix,
+
+  border_color = "white",
+
+  fontsize = 11,
+  fontsize_number = 10,
+
+  main = paste0(
+    "Direction-concordant overlap of significant DEG sets\n",
+    "padj < ",
+    adjusted_p_cutoff,
+    ", |log2FC| > ",
+    absolute_log2fc_cutoff
+  ),
+
+  legend = TRUE
+)
+
+
+grDevices::dev.off()
+```

@@ -1,0 +1,1375 @@
+---
+title: "10X Visium - Overrepresentation analysis"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# Requires `deg_table_all` and `degs_sig` generated in 02_visium_DEG.Rmd.
+
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(dplyr)
+library(stringr)
+library(rrvgo)
+library(GOSemSim)
+library(ggnewscale)
+
+output_dir <- "03_pathway_analysis"
+
+dir.create(
+    output_dir,
+    showWarnings = FALSE,
+    recursive = TRUE
+)
+```
+
+
+```{r}
+### ORA PREPARATION
+
+all_genes <- unique(deg_table_all$gene)
+
+map1 <- bitr(all_genes, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Mm.eg.db)
+map2 <- bitr(setdiff(all_genes, map1$SYMBOL), fromType="ALIAS", toType="ENTREZID", OrgDb=org.Mm.eg.db) %>%
+  rename(SYMBOL = ALIAS)
+
+gene_map <- bind_rows(map1, map2) %>%
+  distinct(SYMBOL, .keep_all = TRUE)
+
+universe_genes <- unique(gene_map$ENTREZID)
+```
+
+
+```{r}
+### OVERREPRESENTATION ANALYSIS NAS
+
+df_sig_NAS <- degs_sig %>%
+  filter(region == "NAS") %>%
+  mutate(gene = trimws(as.character(gene)))
+  
+
+sig_all_NAS <- df_sig_NAS %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_all_NAS <- enrichGO(
+  gene          = sig_all_NAS,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_all_NAS <- enrichKEGG(
+  gene          = sig_all_NAS,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+
+# Upregulated genes only
+
+sig_up_NAS <- df_sig_NAS %>%
+  filter(avg_log2FC > 0) %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_up_NAS <- enrichGO(
+  gene          = sig_up_NAS,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_up_NAS <- enrichKEGG(
+  gene          = sig_up_NAS,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+# Downregulated genes only
+
+sig_down_NAS <- df_sig_NAS %>%
+  filter(avg_log2FC < 0) %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_down_NAS <- enrichGO(
+  gene          = sig_down_NAS,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_down_NAS <- enrichKEGG(
+  gene          = sig_down_NAS,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+
+### NAS ORA tables
+
+ora_NAS_all_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_all_NAS)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_all_NAS) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_NAS_all_table, file.path(output_dir, "Table_S9_NAS_ORA_all_GO_KEGG.csv"), row.names = FALSE)
+
+
+ora_NAS_up_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_up_NAS)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_up_NAS) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_NAS_up_table, file.path(output_dir, "Table_S10_NAS_ORA_up_GO_KEGG.csv"), row.names = FALSE)
+
+
+ora_NAS_down_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_down_NAS)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_down_NAS) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_NAS_down_table, file.path(output_dir, "Table_S11_NAS_ORA_down_GO_KEGG.csv"), row.names = FALSE)
+```
+
+```{r}
+### OVERREPRESENTATION ANALYSIS dSTRr
+
+df_sig_dSTRr <- degs_sig %>%
+  filter(region == "dSTRr") %>%
+  mutate(gene = trimws(as.character(gene)))
+  
+
+sig_all_dSTRr <- df_sig_dSTRr %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_all_dSTRr <- enrichGO(
+  gene          = sig_all_dSTRr,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_all_dSTRr <- enrichKEGG(
+  gene          = sig_all_dSTRr,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+
+# Upregulated genes only
+
+sig_up_dSTRr <- df_sig_dSTRr %>%
+  filter(avg_log2FC > 0) %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_up_dSTRr <- enrichGO(
+  gene          = sig_up_dSTRr,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_up_dSTRr <- enrichKEGG(
+  gene          = sig_up_dSTRr,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+# Downregulated genes only
+
+sig_down_dSTRr <- df_sig_dSTRr %>%
+  filter(avg_log2FC < 0) %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_down_dSTRr <- enrichGO(
+  gene          = sig_down_dSTRr,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_down_dSTRr <- enrichKEGG(
+  gene          = sig_down_dSTRr,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+
+### dSTRr ORA tables
+
+ora_dSTRr_all_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_all_dSTRr)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_all_dSTRr) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_dSTRr_all_table, file.path(output_dir, "Table_S12_dSTRr_ORA_all_GO_KEGG.csv"), row.names = FALSE)
+
+
+ora_dSTRr_up_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_up_dSTRr)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_up_dSTRr) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_dSTRr_up_table, file.path(output_dir, "Table_S13_dSTRr_ORA_up_GO_KEGG.csv"), row.names = FALSE)
+
+
+ora_dSTRr_down_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_down_dSTRr)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_down_dSTRr) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_dSTRr_down_table, file.path(output_dir, "Table_S14_dSTRr_ORA_down_GO_KEGG.csv"), row.names = FALSE)
+```
+
+```{r}
+### OVERREPRESENTATION ANALYSIS PIRc
+
+df_sig_PIRc <- degs_sig %>%
+  filter(region == "PIRc") %>%
+  mutate(gene = trimws(as.character(gene)))
+  
+
+sig_all_PIRc <- df_sig_PIRc %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_all_PIRc <- enrichGO(
+  gene          = sig_all_PIRc,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_all_PIRc <- enrichKEGG(
+  gene          = sig_all_PIRc,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+
+# Upregulated genes only
+
+sig_up_PIRc <- df_sig_PIRc %>%
+  filter(avg_log2FC > 0) %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_up_PIRc <- enrichGO(
+  gene          = sig_up_PIRc,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_up_PIRc <- enrichKEGG(
+  gene          = sig_up_PIRc,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+# Downregulated genes only
+
+sig_down_PIRc <- df_sig_PIRc %>%
+  filter(avg_log2FC < 0) %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_down_PIRc <- enrichGO(
+  gene          = sig_down_PIRc,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_down_PIRc <- enrichKEGG(
+  gene          = sig_down_PIRc,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+
+### PIRc ORA tables
+
+ora_PIRc_all_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_all_PIRc)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_all_PIRc) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_PIRc_all_table, file.path(output_dir, "Table_S15_PIRc_ORA_all_GO_KEGG.csv"), row.names = FALSE)
+
+
+ora_PIRc_up_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_up_PIRc)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_up_PIRc) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_PIRc_up_table, file.path(output_dir, "Table_S16_PIRc_ORA_up_GO_KEGG.csv"), row.names = FALSE)
+
+
+ora_PIRc_down_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_down_PIRc)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_down_PIRc) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_PIRc_down_table, file.path(output_dir, "Table_S17_PIRc_ORA_down_GO_KEGG.csv"), row.names = FALSE)
+
+```
+
+```{r}
+### OVERREPRESENTATION ANALYSIS dSTRc
+
+df_sig_dSTRc <- degs_sig %>%
+  filter(region == "dSTRc") %>%
+  mutate(gene = trimws(as.character(gene)))
+  
+
+sig_all_dSTRc <- df_sig_dSTRc %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_all_dSTRc <- enrichGO(
+  gene          = sig_all_dSTRc,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_all_dSTRc <- enrichKEGG(
+  gene          = sig_all_dSTRc,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+
+# Upregulated genes only
+
+sig_up_dSTRc <- df_sig_dSTRc %>%
+  filter(avg_log2FC > 0) %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_up_dSTRc <- enrichGO(
+  gene          = sig_up_dSTRc,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_up_dSTRc <- enrichKEGG(
+  gene          = sig_up_dSTRc,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+# Downregulated genes only
+
+sig_down_dSTRc <- df_sig_dSTRc %>%
+  filter(avg_log2FC < 0) %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_down_dSTRc <- enrichGO(
+  gene          = sig_down_dSTRc,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_down_dSTRc <- enrichKEGG(
+  gene          = sig_down_dSTRc,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+
+### dSTRc ORA tables
+
+ora_dSTRc_all_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_all_dSTRc)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_all_dSTRc) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_dSTRc_all_table, file.path(output_dir, "Table_S18_dSTRc_ORA_all_GO_KEGG.csv"), row.names = FALSE)
+
+
+ora_dSTRc_up_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_up_dSTRc)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_up_dSTRc) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_dSTRc_up_table, file.path(output_dir, "Table_S19_dSTRc_ORA_up_GO_KEGG.csv"), row.names = FALSE)
+
+
+ora_dSTRc_down_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_down_dSTRc)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_down_dSTRc) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_dSTRc_down_table, file.path(output_dir, "Table_S20_dSTRc_ORA_down_GO_KEGG.csv"), row.names = FALSE)
+```
+
+```{r}
+### OVERREPRESENTATION ANALYSIS S1c
+
+df_sig_S1c <- degs_sig %>%
+  filter(region == "S1c") %>%
+  mutate(gene = trimws(as.character(gene)))
+  
+
+sig_all_S1c <- df_sig_S1c %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_all_S1c <- enrichGO(
+  gene          = sig_all_S1c,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_all_S1c <- enrichKEGG(
+  gene          = sig_all_S1c,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+
+# Upregulated genes only
+
+sig_up_S1c <- df_sig_S1c %>%
+  filter(avg_log2FC > 0) %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_up_S1c <- enrichGO(
+  gene          = sig_up_S1c,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_up_S1c <- enrichKEGG(
+  gene          = sig_up_S1c,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+# Downregulated genes only
+
+sig_down_S1c <- df_sig_S1c %>%
+  filter(avg_log2FC < 0) %>%
+  inner_join(gene_map, by = c("gene" = "SYMBOL")) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+ora_go_down_S1c <- enrichGO(
+  gene          = sig_down_S1c,
+  universe      = universe_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ora_kegg_down_S1c <- enrichKEGG(
+  gene          = sig_down_S1c,
+  universe      = universe_genes,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+
+### S1c ORA tables
+
+ora_S1c_all_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_all_S1c)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_all_S1c) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_S1c_all_table, file.path(output_dir, "Table_S21_S1c_ORA_all_GO_KEGG.csv"), row.names = FALSE)
+
+
+ora_S1c_up_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_up_S1c)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_up_S1c) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_S1c_up_table, file.path(output_dir, "Table_S22_S1c_ORA_up_GO_KEGG.csv"), row.names = FALSE)
+
+
+ora_S1c_down_table <- dplyr::bind_rows(
+  as.data.frame(ora_go_down_S1c)   %>% dplyr::mutate(database = "GO"),
+  as.data.frame(ora_kegg_down_S1c) %>% dplyr::mutate(database = "KEGG")
+) %>%
+  dplyr::select(database, ONTOLOGY, ID, Description, GeneRatio, FoldEnrichment, p.adjust, geneID)
+
+write.csv(ora_S1c_down_table, file.path(output_dir, "Table_S23_S1c_ORA_down_GO_KEGG.csv"), row.names = FALSE)
+```
+
+
+```{r}
+### ORA INTEGRATION PREPARATION
+
+get_terms <- function(ora_obj, region, direction) {
+  as.data.frame(ora_obj@result) %>%
+    dplyr::filter(ONTOLOGY == "BP", p.adjust < 0.05) %>%
+    dplyr::mutate(
+      region = region,
+      direction = direction
+    )
+}
+
+all_terms <- dplyr::bind_rows(
+  get_terms(ora_go_up_NAS,    "NAS",   "up"),
+  get_terms(ora_go_down_NAS,  "NAS",   "down"),
+  get_terms(ora_go_up_dSTRr,  "dSTRr", "up"),
+  get_terms(ora_go_down_dSTRr,"dSTRr", "down"),
+  get_terms(ora_go_up_PIRc,   "PIRc",  "up"),
+  get_terms(ora_go_down_PIRc, "PIRc",  "down"),
+  get_terms(ora_go_up_dSTRc, "dSTRc", "up"),
+  get_terms(ora_go_down_dSTRc, "dSTRc", "down"),
+  get_terms(ora_go_up_S1c, "S1c", "up"),
+  get_terms(ora_go_down_S1c, "S1c", "down")
+  
+) %>%
+  dplyr::mutate(
+    term_uid = paste(region, direction, ID, sep = "__")
+  )
+
+head(all_terms)
+
+```
+
+```{r}
+### SETTINGS
+
+# Region order
+
+region_order <- c(
+  "dSTRr",
+  "NAS",
+  "PIRc",
+  "dSTRc",
+  "S1c"
+)
+
+
+# Place up and down next to each other within each region
+
+cond_levels <- as.vector(
+  rbind(
+    paste0(region_order, "_up"),
+    paste0(region_order, "_down")
+  )
+)
+
+cond_levels
+
+# Calculate GO semantic similarity matrix
+
+go_ids <- unique(all_terms$ID)
+
+simMatrix <- rrvgo::calculateSimMatrix(
+  go_ids,
+  orgdb = "org.Mm.eg.db",
+  ont = "BP",
+  method = "Wang"
+)
+```
+
+```{r}
+### HIERARCHICAL CLUSTERING
+
+dist_mat <- stats::as.dist(1 - simMatrix)
+
+hc <- stats::hclust(
+  dist_mat,
+  method = "average"
+)
+
+plot(
+  hc,
+  labels = FALSE,
+  hang = -1,
+  main = "GO semantic clustering"
+)
+
+
+# Inspect different cut heights
+
+cutoffs <- seq(
+  0.10,
+  0.90,
+  by = 0.05
+)
+
+cutoff_df <- tibble::tibble(
+  cutoff = cutoffs,
+  n_clusters = vapply(
+    cutoffs,
+    function(h) {
+      length(
+        unique(
+          stats::cutree(
+            hc,
+            h = h
+          )
+        )
+      )
+    },
+    integer(1)
+  )
+)
+
+cutoff_df
+
+
+```
+
+```{r}
+### ASSIGN SEMANTIC CLUSTERS
+
+
+semantic_cut_height <- 0.80
+
+
+semantic_clusters <- stats::cutree(
+  hc,
+  h = semantic_cut_height
+)
+
+n_semantic_clusters <- length(
+  unique(semantic_clusters)
+)
+
+n_semantic_clusters
+```
+
+
+```{r}
+### GO-TERM SCORES AND CLUSTER ASSIGNMENT
+
+go_scores <- all_terms %>%
+  dplyr::group_by(ID) %>%
+  dplyr::summarise(
+    score = max(
+      -log10(p.adjust),
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+
+go_descriptions <- all_terms %>%
+  dplyr::select(
+    ID,
+    Description
+  ) %>%
+  dplyr::distinct(
+    ID,
+    .keep_all = TRUE
+  )
+
+
+semantic_assignment <- tibble::tibble(
+  ID = names(semantic_clusters),
+  semantic_cluster = as.integer(semantic_clusters)
+) %>%
+  dplyr::left_join(
+    go_descriptions,
+    by = "ID"
+  ) %>%
+  dplyr::left_join(
+    go_scores,
+    by = "ID"
+  )
+```
+
+```{r}
+### AUTOMATIC SEMANTIC-CLUSTER SUMMARY
+
+cluster_membership <- all_terms %>%
+  dplyr::arrange(
+    semantic_cluster,
+    region,
+    direction,
+    p.adjust
+  ) %>%
+  dplyr::select(
+    semantic_cluster,
+    semantic_label,
+    semantic_parent,
+    representative_description,
+    region,
+    direction,
+    ID,
+    Description,
+    p.adjust,
+    geneID
+  )
+
+
+utils::write.csv(
+  cluster_membership,
+  file.path(
+    output_dir,
+    paste0(
+      "ora_semantic_cluster_membership_BP_cutoff_",
+      semantic_cut_height,
+      ".csv"
+    )
+  ),
+  row.names = FALSE
+)
+
+
+GO_BP_semantic_cluster_summary <- semantic_assignment %>%
+  dplyr::group_by(semantic_cluster) %>%
+  dplyr::arrange(
+    dplyr::desc(score),
+    ID,
+    .by_group = TRUE
+  ) %>%
+  dplyr::summarise(
+    representative_GO_ID = dplyr::first(ID),
+    representative_description = dplyr::first(Description),
+    representative_score = dplyr::first(score),
+    n_unique_terms = dplyr::n_distinct(ID),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(semantic_cluster)
+
+GO_BP_semantic_cluster_summary
+
+utils::write.csv(
+  GO_BP_semantic_cluster_summary,
+  file.path(
+    output_dir,
+    "GO_BP_semantic_cluster_summary.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+### MANUALLY CURATED SEMANTIC CLUSTER LABELS
+
+semantic_cluster_labels <- tibble::tribble(
+  ~semantic_cluster, ~semantic_label,
+  1L,  "Synaptic vesicle trafficking, recycling, and neurotransmitter release",
+  2L,  "Regulation of neuronal ion transport and neurotransmitter secretion",
+  3L,  "Learning, memory, and neuronal impulse transmission",
+  4L,  "Synaptic organization, cytoskeletal remodeling, and vesicle fusion",
+  5L,  "Postsynaptic receptor trafficking and synaptic membrane localization",
+  6L,  "Bidirectional synaptic plasticity and modulation of excitatory transmission",
+  7L,  "Regulation of neuronal excitability and postsynaptic membrane function",
+  8L,  "Membrane docking and cell–cell fusion",
+  9L,  "Amyloid precursor protein metabolism and proteostasis",
+  10L, "Neural development, neurite morphogenesis, and gliogenesis",
+  11L, "Neuronal calcium and ion homeostasis",
+  12L, "Monoaminergic signaling and responses to psychoactive stimuli",
+  13L, "Sensory stimulus and fear/stress responses",
+  14L, "Locomotor, exploratory, and adult behavior",
+  15L, "Circadian rhythm and rhythmic gene regulation",
+  16L, "Cholesterol and sterol biosynthesis",
+  17L, "Reactive oxygen species production and ATP metabolism",
+  18L, "Regulation of endothelial cell migration",
+  19L, "Negative regulation of neuronal apoptosis"
+)
+```
+
+```{r}
+### ADD MANUAL LABELS TO GO-TERM ASSIGNMENTS
+
+semantic_cluster_info <- GO_BP_semantic_cluster_summary %>%
+  dplyr::left_join(
+    semantic_cluster_labels,
+    by = "semantic_cluster"
+  )
+
+
+# Add semantic clusters and manual labels to all ORA terms
+
+all_terms <- all_terms %>%
+  dplyr::select(
+    -dplyr::any_of(
+      c(
+        "semantic_cluster",
+        "semantic_label",
+        "n_unique_terms"
+      )
+    )
+  ) %>%
+  dplyr::left_join(
+    semantic_assignment %>%
+      dplyr::select(
+        ID,
+        semantic_cluster
+      ),
+    by = "ID"
+  ) %>%
+  dplyr::left_join(
+    semantic_cluster_info %>%
+      dplyr::select(
+        semantic_cluster,
+        semantic_label,
+        n_unique_terms
+      ),
+    by = "semantic_cluster"
+  )
+```
+
+```{r}
+### SANITY CHECK
+
+all_terms %>%
+  dplyr::distinct(
+    semantic_cluster,
+    semantic_label,
+    n_unique_terms
+  ) %>%
+  dplyr::arrange(
+    semantic_cluster
+  )
+```
+
+```{r}
+### BUILD CLUSTER-LEVEL PLOT TABLE
+
+plot_df <- all_terms %>%
+  dplyr::mutate(
+    direction = tolower(direction),
+    cond = paste(
+      region,
+      direction,
+      sep = "_"
+    )
+  ) %>%
+  dplyr::filter(
+    cond %in% cond_levels
+  ) %>%
+  dplyr::group_by(
+    semantic_cluster,
+    semantic_label,
+    cond
+  ) %>%
+  dplyr::summarise(
+    n_pathways = dplyr::n_distinct(ID),
+    med_logp = stats::median(
+      -log10(p.adjust),
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  tidyr::complete(
+    tidyr::nesting(
+      semantic_cluster,
+      semantic_label
+    ),
+    cond = cond_levels,
+    fill = list(
+      n_pathways = 0L,
+      med_logp = NA_real_
+    )
+  ) %>%
+  dplyr::mutate(
+    cond = factor(
+      cond,
+      levels = cond_levels
+    ),
+    direction = dplyr::case_when(
+      grepl(
+        "_up$",
+        as.character(cond)
+      ) ~ "up",
+      grepl(
+        "_down$",
+        as.character(cond)
+      ) ~ "down",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+```{r}
+### CALCULATE CLUSTER SIZES
+
+cluster_sizes <- all_terms %>%
+  dplyr::group_by(
+    semantic_cluster,
+    semantic_label
+  ) %>%
+  dplyr::summarise(
+    n_unique_terms = dplyr::n_distinct(ID),
+    total_occurrences = dplyr::n(),
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+### ORDER CLUSTERS BY SUMMED NUMBER OF DISPLAYED PATHWAYS
+
+minimum_pathways_display <- 5L
+
+
+
+cluster_order_df <- plot_df %>%
+  dplyr::group_by(
+    semantic_cluster,
+    semantic_label
+  ) %>%
+  dplyr::summarise(
+    sum_pathways_displayed = sum(
+      dplyr::if_else(
+        n_pathways >= minimum_pathways_display,
+        n_pathways,
+        0L
+      ),
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+
+  # Remove clusters for which no dot passes the display cutoff
+
+  dplyr::filter(
+    sum_pathways_displayed > 0
+  ) %>%
+
+  # Sort exclusively by the summed pathway count
+
+  dplyr::arrange(
+    dplyr::desc(sum_pathways_displayed)
+  )
+
+
+cluster_order_df
+```
+
+```{r}
+### CREATE LABELS AND APPLY THE NEW CLUSTER ORDER
+
+# Create a unique display label in the ordered cluster table
+
+cluster_order_df <- cluster_order_df %>%
+  dplyr::mutate(
+    cluster_label_full = paste0(
+      semantic_label,
+      " (",
+      semantic_cluster,
+      ")"
+    )
+  )
+
+
+# Add the display label to plot_df
+# Remove an older version first, in case this chunk is rerun
+
+plot_df <- plot_df %>%
+  dplyr::select(
+    -dplyr::any_of("cluster_label_full")
+  ) %>%
+  dplyr::left_join(
+    cluster_order_df %>%
+      dplyr::select(
+        semantic_cluster,
+        cluster_label_full
+      ),
+    by = "semantic_cluster"
+  )
+
+
+# Extract the order established in section 14
+
+cluster_order <- cluster_order_df$cluster_label_full
+
+
+# Reverse factor levels because ggplot draws the first level at the bottom
+
+plot_df <- plot_df %>%
+  dplyr::mutate(
+    cluster_label_full = factor(
+      cluster_label_full,
+      levels = rev(cluster_order)
+    )
+  )
+```
+
+```{r}
+### PREPARE VISIBLE DOTS
+
+plot_df_visible <- plot_df %>%
+  dplyr::filter(
+    n_pathways >= minimum_pathways_display,
+    !is.na(cluster_label_full),
+    !is.na(med_logp)
+  ) %>%
+  dplyr::mutate(
+    # Remove any previously stored factor ordering
+    cluster_label_full = as.character(cluster_label_full)
+  )
+
+
+if (nrow(plot_df_visible) == 0) {
+  stop(
+    paste0(
+      "No dots remain after applying n_pathways >= ",
+      minimum_pathways_display,
+      "."
+    )
+  )
+}
+```
+
+```{r}
+### SHARED COLOR RANGE
+
+# Using one shared significance range makes red and blue shades
+# directly comparable.
+
+color_min <- min(
+  plot_df_visible$med_logp,
+  na.rm = TRUE
+)
+
+color_max <- max(
+  plot_df_visible$med_logp,
+  na.rm = TRUE
+)
+
+
+size_max <- max(
+  plot_df_visible$n_pathways,
+  na.rm = TRUE
+)
+
+
+candidate_size_breaks <- c(
+  5,
+  10,
+  20,
+  30,
+  50,
+  75,
+  100
+)
+
+size_breaks <- candidate_size_breaks[
+  candidate_size_breaks >= minimum_pathways_display &
+    candidate_size_breaks <= size_max
+]
+
+if (length(size_breaks) == 0) {
+  size_breaks <- unique(
+    c(
+      minimum_pathways_display,
+      size_max
+    )
+  )
+}
+```
+
+```{r}
+### FINAL DOT PLOT
+
+p_clusters <- ggplot2::ggplot(
+  plot_df_visible,
+  ggplot2::aes(
+    x = cond,
+    y = cluster_label_full
+  )
+) +
+
+  # Upregulated
+
+  ggplot2::geom_point(
+    data = plot_df_visible %>%
+      dplyr::filter(
+        direction == "up"
+      ),
+    ggplot2::aes(
+      size = n_pathways,
+      color = med_logp
+    )
+  ) +
+
+  ggplot2::scale_color_gradient(
+    name = "Upregulated\nmedian adjusted p",
+    low = "#fcae91",
+    high = "#99000d",
+    limits = c(
+      color_min,
+      color_max
+    ),
+    labels = function(x) {
+      format(
+        10^(-x),
+        scientific = TRUE,
+        digits = 2
+      )
+    }
+  ) +
+
+  ggnewscale::new_scale_color() +
+
+  # Downregulated
+
+  ggplot2::geom_point(
+    data = plot_df_visible %>%
+      dplyr::filter(
+        direction == "down"
+      ),
+    ggplot2::aes(
+      size = n_pathways,
+      color = med_logp
+    )
+  ) +
+
+  ggplot2::scale_color_gradient(
+    name = "Downregulated\nmedian adjusted p",
+    low = "#bdd7e7",
+    high = "#08519c",
+    limits = c(
+      color_min,
+      color_max
+    ),
+    labels = function(x) {
+      format(
+        10^(-x),
+        scientific = TRUE,
+        digits = 2
+      )
+    }
+  ) +
+
+  # Dot size
+
+  ggplot2::scale_size(
+    name = "Number of pathways",
+    range = c(
+      3,
+      10
+    ),
+    breaks = size_breaks,
+    limits = c(
+      minimum_pathways_display,
+      size_max
+    )
+  ) +
+
+  # Region/Direction order
+
+  ggplot2::scale_x_discrete(
+    limits = cond_levels,
+    labels = c(
+      "dSTRr\nUp",
+      "dSTRr\nDown",
+      "NAS\nUp",
+      "NAS\nDown",
+      "PIRc\nUp",
+      "PIRc\nDown",
+      "dSTRc\nUp",
+      "dSTRc\nDown",
+      "S1c\nUp",
+      "S1c\nDown"
+    ),
+    drop = FALSE
+  ) +
+
+   ggplot2::scale_y_discrete(
+    limits = rev(cluster_order),
+    drop = TRUE
+  ) +
+
+  ggplot2::labs(
+    x = NULL,
+    y = NULL
+  ) +
+
+  ggplot2::theme_bw() +
+
+  ggplot2::theme(
+    panel.grid.major = ggplot2::element_line(
+      linewidth = 0.25,
+      color = "grey85"
+    ),
+    panel.grid.minor = ggplot2::element_blank(),
+
+    axis.text.x = ggplot2::element_text(
+      angle = 0,
+      hjust = 0.5,
+      vjust = 1,
+      size = 10
+    ),
+
+    axis.text.y = ggplot2::element_text(
+      size = 10
+    ),
+
+    legend.title = ggplot2::element_text(
+      size = 10
+    ),
+
+    legend.text = ggplot2::element_text(
+      size = 9
+    )
+  )
+
+
+p_clusters
+
+
+ggplot2::ggsave(
+  filename = file.path(
+    output_dir,
+    "GO_semantic_cluster_dotplot.pdf"
+  ),
+  plot = p_clusters,
+  device = grDevices::cairo_pdf,
+  width = 16,
+  height = 8,
+  units = "in",
+  dpi = 300,
+  limitsize = FALSE
+)
+```
+
+

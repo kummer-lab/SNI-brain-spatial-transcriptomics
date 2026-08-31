@@ -1,0 +1,930 @@
+---
+title: "10X Visium analysis - DEG analysis"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(tidyr)
+library(tibble)
+library(DESeq2)
+library(matrixStats)
+library(ggdendro)
+library(pheatmap)
+
+load("Visium_Pain_clean.RData")  # loads experiment
+experiment <- UpdateSeuratObject(experiment)
+```
+
+```{r}
+### Region-wise DEG analysis Seurat v5
+
+output_dir <- "02_1_region-wise DEG-Sv5"
+dir.create(output_dir, showWarnings = FALSE)
+
+
+DefaultAssay(experiment) <- "Spatial"
+
+all_regions <- sort(unique(experiment$labels))
+
+deg_list <- list()
+
+
+for (region in all_regions) {
+  
+  cat("Processing region:", region, "\n")
+  
+  region_obj <- subset(
+    experiment,
+    subset = labels == region
+  )
+  
+  Idents(region_obj) <- "condition"
+  
+  
+  # Skip if one condition is absent
+  
+  if (!all(c("sham", "SNI") %in%
+           unique(as.character(Idents(region_obj))))) {
+    
+    cat("  Skipping", region, "- missing condition level\n")
+    next
+  }
+  
+  
+  degs <- FindMarkers(
+    object = region_obj,
+    ident.1 = "SNI",
+    ident.2 = "sham",
+    assay = "Spatial",
+    slot = "data",
+    fc.slot = "data",
+    test.use = "wilcox",
+    min.pct = 0,
+    logfc.threshold = 0,
+    only.pos = FALSE
+  )
+  
+  
+  degs$gene <- rownames(degs)
+  degs$region <- region
+  
+  deg_list[[region]] <- degs
+}
+
+
+# Combine outputs
+
+deg_table_all <- bind_rows(deg_list)
+
+
+degs_sig <- deg_table_all %>%
+  filter(
+    !is.na(p_val_adj),
+    p_val_adj < 0.05
+  )
+
+
+degs_sig_fc <- deg_table_all %>%
+  filter(
+    !is.na(p_val_adj),
+    p_val_adj < 0.05,
+    abs(avg_log2FC) > 0.25
+  )
+
+
+summarise_degs_by_region <- function(deg_table, all_regions) {
+  
+  deg_table %>%
+    group_by(region) %>%
+    summarise(
+      n_up_SNI = sum(avg_log2FC > 0, na.rm = TRUE),
+      n_down_SNI = sum(avg_log2FC < 0, na.rm = TRUE),
+      n_deg_total = n(),
+      .groups = "drop"
+    ) %>%
+    right_join(
+      data.frame(region = all_regions),
+      by = "region"
+    ) %>%
+    mutate(
+      n_up_SNI = replace_na(n_up_SNI, 0L),
+      n_down_SNI = replace_na(n_down_SNI, 0L),
+      n_deg_total = replace_na(n_deg_total, 0L)
+    ) %>%
+    arrange(desc(n_deg_total))
+}
+
+
+deg_summary_sig <- summarise_degs_by_region(
+  degs_sig,
+  all_regions
+)
+
+
+deg_summary_sig_fc <- summarise_degs_by_region(
+  degs_sig_fc,
+  all_regions
+)
+
+
+write.csv(
+  deg_table_all,
+  file.path(output_dir, "deg_table_all_regions-Sv5.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  deg_summary_sig,
+  file.path(output_dir, "deg_summary_sig-Sv5.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  deg_summary_sig_fc,
+  file.path(output_dir, "deg_summary_sig_fc-Sv5.csv"),
+  row.names = FALSE
+)
+```
+
+
+```{r}
+### DEG MAPPING ON SNI1
+
+output_dir <- "02_2_DEG burden"
+dir.create(output_dir, showWarnings = FALSE)
+
+
+deg_map <- setNames(deg_summary_sig_fc$n_deg_total, as.character(deg_summary_sig_fc$region))
+
+experiment$deg_burden <- unname(
+  deg_map[as.character(experiment$labels)]
+)
+
+
+
+### Identify the five regions with the highest DEG burden
+
+top_regions <- deg_summary_sig_fc %>%
+  arrange(desc(n_deg_total)) %>%
+  slice_head(n = 5) %>%
+  pull(region)
+
+
+### Obtain SNI1 spot coordinates and region labels
+
+sni1_coordinates <- experiment@images$SNI1@coordinates %>%
+  rownames_to_column("barcode") %>%
+  left_join(
+    experiment@meta.data %>%
+      rownames_to_column("barcode") %>%
+      select(
+        barcode,
+        labels
+      ),
+    by = "barcode"
+  )
+
+
+### Calculate centroid of each top region on SNI1
+
+label_df <- sni1_coordinates %>%
+  filter(
+    labels %in% top_regions
+  ) %>%
+  group_by(labels) %>%
+  summarise(
+    x = mean(imagecol, na.rm = TRUE),
+    y = mean(imagerow, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+p <- SpatialFeaturePlot(
+  experiment,
+  images = "SNI1",
+  features = "deg_burden",
+  image.alpha = 0,
+  pt.size.factor = 2000,
+  crop = TRUE
+) +
+  scale_fill_gradient(
+    low = "#fce4ec",
+    high = "#ad1457",
+    na.value = "grey90"
+  ) +
+  labs(fill = "DEGs per region") +
+  theme(
+    plot.title = element_blank()
+  )
+
+p
+
+ggsave(
+  file.path(output_dir,"deg_burden_spatialplot.pdf"),
+  plot = p,
+  width = 6,
+  height = 5,
+  units = "in",
+  device = cairo_pdf
+)
+
+```
+
+```{r}
+### DEG BURDEN BARPLOT
+
+output_dir <- "02_2_DEG burden"
+dir.create(output_dir, showWarnings = FALSE)
+
+
+deg_summary_sig_fc_long <- deg_summary_sig_fc %>%
+  dplyr::select(
+    region,
+    n_up_SNI,
+    n_down_SNI
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(
+      n_up_SNI,
+      n_down_SNI
+    ),
+    names_to = "direction",
+    values_to = "n_genes"
+  ) %>%
+  mutate(
+    direction = recode(
+      direction,
+      n_up_SNI = "Up in SNI",
+      n_down_SNI = "Down in SNI"
+    ),
+    region = factor(
+      region,
+      levels = rev(deg_summary_sig_fc$region)
+    )
+  )
+
+
+p <- ggplot(
+  deg_summary_sig_fc_long,
+  aes(
+    x = region,
+    y = n_genes,
+    fill = direction
+  )
+) +
+  geom_col(
+    width = 0.8
+  ) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "Down in SNI" = "#2166AC",
+      "Up in SNI" = "#B2182B"
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Number of DEGs",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+
+p
+
+
+ggsave(
+  file.path(
+    output_dir,
+    "deg_burden_barplot.pdf"
+  ),
+  plot = p,
+  width = 6,
+  height = 6,
+  units = "in",
+  device = cairo_pdf
+)
+
+```
+
+```{r}
+### VOLCANO PLOTS FOR TOP 5 REGIONS BY DEG BURDEN
+
+output_dir <- "02_3_Volcano plots"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Top five regions based on significant DEGs with |log2FC| > 0.25
+top5_regions <- deg_summary_sig_fc %>%
+  arrange(desc(n_deg_total)) %>%
+  slice_head(n = 5) %>%
+  pull(region)
+
+top5_regions
+
+volcano_plots <- list()
+
+for (region_of_interest in top5_regions) {
+
+  volcano_df <- deg_table_all %>%
+    filter(region == region_of_interest) %>%
+    mutate(
+      neg_log10_padj = -log10(p_val_adj + 1e-300),
+
+      sig = case_when(
+        p_val_adj < 0.05 & avg_log2FC > 0.25  ~ "Up in SNI",
+        p_val_adj < 0.05 & avg_log2FC < -0.25 ~ "Down in SNI",
+        TRUE                                  ~ "NS"
+      )
+    )
+
+  # Label the 25 most significant genes that also pass the FC cutoff
+  top_labels <- volcano_df %>%
+    filter(
+      p_val_adj < 0.05,
+      abs(avg_log2FC) > 0.25
+    ) %>%
+    arrange(p_val_adj) %>%
+    slice_head(n = 25)
+
+  p <- ggplot(
+    volcano_df,
+    aes(
+      x = avg_log2FC,
+      y = neg_log10_padj,
+      color = sig
+    )
+  ) +
+    geom_point(
+      size = 1.8,
+      alpha = 0.8
+    ) +
+    scale_color_manual(
+      values = c(
+        "Down in SNI" = "#2166AC",
+        "Up in SNI"   = "#B2182B",
+        "NS"          = "grey75"
+      ),
+      breaks = c(
+        "Up in SNI",
+        "Down in SNI",
+        "NS"
+      )
+    ) +
+    geom_vline(
+      xintercept = c(-0.25, 0.25),
+      linetype = "dashed",
+      color = "grey40"
+    ) +
+    geom_hline(
+      yintercept = -log10(0.05),
+      linetype = "dashed",
+      color = "grey40"
+    ) +
+    ggrepel::geom_text_repel(
+      data = top_labels,
+      aes(label = gene),
+      size = 3,
+      color = "black",
+      max.overlaps = Inf,
+      show.legend = FALSE
+    ) +
+    labs(
+      title = region_of_interest,
+      x = expression(log[2] * " fold change (SNI vs sham)"),
+      y = expression(-log[10] * " adjusted p-value"),
+      color = NULL
+    ) +
+    theme_classic()
+
+  volcano_plots[[region_of_interest]] <- p
+
+  ggsave(
+    filename = file.path(
+      output_dir,
+      paste0("volcano_plot_", region_of_interest, ".pdf")
+    ),
+    plot = p,
+    width = 6,
+    height = 5,
+    units = "in",
+    device = cairo_pdf
+  )
+}
+
+volcano_plots
+```
+
+```{r}
+### HEATMAP: TOP 5 REGIONS × UNION OF TOP 10 DEGs
+### Regions and genes clustered using Euclidean distance and Ward.D2
+
+
+output_dir <- "02_4_Heatmap Top 5 regions x Top 10 DEGs"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Select the five regions with the highest total DEG burden
+top5_regions <- deg_summary_sig_fc %>%
+  arrange(desc(n_deg_total)) %>%
+  slice_head(n = 5) %>%
+  pull(region)
+
+top5_regions
+
+
+# Select the top 10 significant DEGs within each region
+# Ranked by adjusted p-value, then absolute log2FC
+top_genes_per_region <- degs_sig_fc %>%
+  filter(region %in% top5_regions) %>%
+  group_by(region) %>%
+  arrange(
+    p_val_adj,
+    desc(abs(avg_log2FC)),
+    .by_group = TRUE
+  ) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+top_genes_per_region
+
+
+# Union of selected genes
+genes_keep <- unique(top_genes_per_region$gene)
+
+length(genes_keep)
+genes_keep
+
+
+# Build gene × region matrix
+# Significant entries retain their signed avg_log2FC
+# Non-significant entries are set to NA and displayed as white
+heatmap_mat <- deg_table_all %>%
+  filter(
+    region %in% top5_regions,
+    gene %in% genes_keep
+  ) %>%
+  mutate(
+    heatmap_log2FC = if_else(
+      p_val_adj < 0.05 & abs(avg_log2FC) > 0.25,
+      avg_log2FC,
+      NA_real_
+    )
+  ) %>%
+  dplyr::select(
+    gene,
+    region,
+    heatmap_log2FC
+  ) %>%
+  distinct(
+    gene,
+    region,
+    .keep_all = TRUE
+  ) %>%
+  complete(
+    gene = genes_keep,
+    region = top5_regions
+  ) %>%
+  pivot_wider(
+    names_from = region,
+    values_from = heatmap_log2FC
+  ) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+
+# Transpose so regions are rows and genes are columns
+heatmap_mat <- t(heatmap_mat)
+
+
+# Remove genes without a significant value in any of the five regions
+heatmap_mat <- heatmap_mat[
+  ,
+  colSums(!is.na(heatmap_mat)) > 0,
+  drop = FALSE
+]
+
+
+# Create a separate matrix for clustering
+# Non-significant values are treated as zero for distance calculation
+clustering_mat <- heatmap_mat
+clustering_mat[is.na(clustering_mat)] <- 0
+
+
+# Remove genes with no variation across regions
+gene_sd <- apply(
+  clustering_mat,
+  2,
+  sd
+)
+
+clustering_mat <- clustering_mat[
+  ,
+  gene_sd > 0,
+  drop = FALSE
+]
+
+# Keep display matrix synchronized
+heatmap_mat <- heatmap_mat[
+  ,
+  colnames(clustering_mat),
+  drop = FALSE
+]
+
+
+# Check that clustering matrix contains valid values
+stopifnot(
+  all(is.finite(clustering_mat))
+)
+
+
+# Cluster regions using Euclidean distance and Ward.D2
+hc_regions <- hclust(
+  dist(
+    clustering_mat,
+    method = "euclidean"
+  ),
+  method = "ward.D2"
+)
+
+
+# Cluster genes using Euclidean distance and Ward.D2
+hc_genes <- hclust(
+  dist(
+    t(clustering_mat),
+    method = "euclidean"
+  ),
+  method = "ward.D2"
+)
+
+
+# Symmetric colour scale around zero
+max_abs_fc <- max(
+  abs(heatmap_mat),
+  na.rm = TRUE
+)
+
+heatmap_colors <- colorRampPalette(
+  c("darkblue", "white", "darkred")
+)(100)
+
+heatmap_breaks <- seq(
+  -max_abs_fc,
+  max_abs_fc,
+  length.out = 101
+)
+
+
+# Generate heatmap
+pheatmap(
+  heatmap_mat,
+
+  color = heatmap_colors,
+  breaks = heatmap_breaks,
+  na_col = "white",
+
+  cluster_rows = hc_regions,
+  cluster_cols = hc_genes,
+
+  border_color = "grey90",
+
+  fontsize = 8,
+  fontsize_row = 9,
+  fontsize_col = 7,
+  angle_col = 45,
+
+  legend = TRUE,
+  legend_breaks = c(
+    -max_abs_fc,
+    0,
+    max_abs_fc
+  ),
+  legend_labels = round(
+    c(-max_abs_fc, 0, max_abs_fc),
+    2
+  ),
+
+  main = "Top 10 DEGs per region",
+
+  filename = file.path(output_dir,"top10_DEGs_top5_regions_euclidean_heatmap.pdf"),
+
+  width = max(
+    8,
+    0.22 * ncol(heatmap_mat) + 2
+  ),
+
+  height = 4
+)
+```
+
+```{r}
+### HEATMAP: ALL REGIONS USING THE UNION OF TOP 10 DEGs
+### Gene set derived from the top 5 DEG-burden regions
+### Regions and genes clustered using Euclidean distance and Ward.D2
+
+
+meta_qc <- experiment@meta.data %>%
+  tibble::rownames_to_column("barcode") %>%
+  dplyr::mutate(region = labels, sample = sample)
+
+complete_regions <- meta_qc %>%
+  dplyr::filter(!is.na(region), !is.na(sample)) %>%
+  dplyr::count(region, sample, name = "n") %>%
+  tidyr::complete(region, sample, fill = list(n = 0)) %>%
+  dplyr::group_by(region) %>%
+  dplyr::summarise(
+    n_samples_present = sum(n > 0),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(n_samples_present == 4) %>%
+  dplyr::pull(region)
+
+
+# Obtain all regions represented in the complete DEG table
+heatmap_regions <- deg_table_all %>%
+  filter(region %in% complete_regions) %>%
+  distinct(region) %>%
+  pull(region)
+
+heatmap_regions
+
+
+# Build region × gene matrix
+#
+# Continuous signed avg_log2FC values are retained for all regions,
+# regardless of whether the gene is significant in that region.
+# Missing gene-region combinations are set to zero.
+
+heatmap_all_regions <- deg_table_all %>%
+  filter(region %in% complete_regions, gene %in% genes_keep) %>%
+  mutate(
+    heatmap_log2FC = if_else(
+      p_val_adj < 0.05 & abs(avg_log2FC) > 0.25,
+      avg_log2FC,
+      0
+    )
+  ) %>%
+  dplyr::select(
+    gene,
+    region,
+    heatmap_log2FC
+  ) %>%
+  distinct(
+    gene,
+    region,
+    .keep_all = TRUE
+  ) %>%
+  complete(
+    gene = genes_keep,
+    region = heatmap_regions,
+    fill = list(heatmap_log2FC = 0)
+  ) %>%
+  pivot_wider(
+    names_from = gene,
+    values_from = heatmap_log2FC,
+    values_fill = 0
+  ) %>%
+  column_to_rownames("region") %>%
+  as.matrix()
+
+
+# Check that the matrix contains only finite values
+stopifnot(
+  all(is.finite(heatmap_all_regions))
+)
+
+
+# Remove genes with no variation across regions
+gene_sd <- apply(
+  heatmap_all_regions,
+  2,
+  sd
+)
+
+heatmap_all_regions <- heatmap_all_regions[
+  ,
+  gene_sd > 0,
+  drop = FALSE
+]
+
+
+# Remove regions with no variation across the selected genes
+region_sd <- apply(
+  heatmap_all_regions,
+  1,
+  sd
+)
+
+heatmap_all_regions <- heatmap_all_regions[
+  region_sd > 0,
+  ,
+  drop = FALSE
+]
+
+
+# Cluster regions using Euclidean distance and Ward.D2
+hc_regions <- hclust(
+  dist(
+    heatmap_all_regions,
+    method = "euclidean"
+  ),
+  method = "ward.D2"
+)
+
+
+# Cluster genes using Euclidean distance and Ward.D2
+hc_genes <- hclust(
+  dist(
+    t(heatmap_all_regions),
+    method = "euclidean"
+  ),
+  method = "ward.D2"
+)
+
+
+# Symmetric colour scale around zero
+max_abs_fc <- max(
+  abs(heatmap_all_regions),
+  na.rm = TRUE
+)
+
+heatmap_colors <- colorRampPalette(
+  c("darkblue", "white", "darkred")
+)(100)
+
+heatmap_breaks <- seq(
+  -max_abs_fc,
+  max_abs_fc,
+  length.out = 101
+)
+
+
+# Highlight the five regions used to define the gene signature
+region_annotation <- data.frame(
+  Signature_source = ifelse(
+    rownames(heatmap_all_regions) %in% top5_regions,
+    "Top 5 region",
+    "Other region"
+  )
+)
+
+rownames(region_annotation) <- rownames(heatmap_all_regions)
+
+
+
+# Generate heatmap
+pheatmap(
+  heatmap_all_regions,
+
+  color = heatmap_colors,
+  breaks = heatmap_breaks,
+
+  cluster_rows = hc_regions,
+  cluster_cols = hc_genes,
+
+  annotation_row = region_annotation,
+  
+  border_color = "grey90",
+
+  fontsize = 7,
+  fontsize_row = 7,
+  fontsize_col = 6,
+  angle_col = 45,
+
+  legend = TRUE,
+  legend_breaks = c(
+    -max_abs_fc,
+    0,
+    max_abs_fc
+  ),
+  legend_labels = round(
+    c(-max_abs_fc, 0, max_abs_fc),
+    2
+  ),
+
+  main = "All regions: projected on top-10 DEG signature",
+
+  filename = file.path(output_dir,"all_regions_top10_DEG_signature_euclidean_heatmap.pdf"),
+
+  width = max(
+    10,
+    0.22 * ncol(heatmap_all_regions) + 3
+  ),
+
+  height = max(
+    7,
+    0.22 * nrow(heatmap_all_regions) + 2
+  )
+)
+```
+
+```{r}
+### SUPPLEMENTARY DEG TABLES
+
+output_dir <- "02_5_supplementary tables DEG"
+dir.create(output_dir, showWarnings = FALSE)
+
+
+padj_cutoff <- 0.05
+logfc_cutoff <- 0.25
+
+deg_table_annotated <- deg_table_all %>%
+  dplyr::filter(region %in% complete_regions) %>%
+  dplyr::mutate(
+    significant = p_val_adj < padj_cutoff & abs(avg_log2FC) > logfc_cutoff
+  )
+
+# 1. DEG summary (single threshold only)
+deg_summary_thresholds <- deg_table_annotated %>%
+  dplyr::group_by(region) %>%
+  dplyr::summarise(
+    n_genes_tested = sum(!is.na(p_val_adj)),
+    n_deg = sum(significant, na.rm = TRUE),
+    percent_deg = 100 * n_deg / n_genes_tested,
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(desc(n_deg))
+
+write.csv(
+  deg_summary_thresholds,
+  file.path(output_dir,"Table_S4_DEG_summary_by_region.csv"),
+  row.names = FALSE
+)
+
+# 2. Full DEG table (keep as supplementary data file)
+write.csv(
+  deg_table_annotated,
+  file.path(output_dir,"Table_S5_full_regionwise_DEG_results.csv"),
+  row.names = FALSE
+)
+
+# 3. Significant DEGs only (clean)
+degs_sig_export <- deg_table_annotated %>%
+  dplyr::filter(significant) %>%
+  dplyr::select(
+    region,
+    gene,
+    avg_log2FC,
+    pct.1,
+    pct.2,
+    p_val,
+    p_val_adj
+  ) %>%
+  dplyr::arrange(region, p_val_adj, dplyr::desc(abs(avg_log2FC)))
+
+write.csv(
+  degs_sig_export,
+  file.path(output_dir,"Table_S6_significant_DEGs.csv"),
+  row.names = FALSE
+)
+
+# 4. Top 10 DEGs per region (no direction split)
+top_deg_per_region <- degs_sig_export %>%
+  dplyr::group_by(region) %>%
+  dplyr::arrange(p_val_adj, dplyr::desc(abs(avg_log2FC)), .by_group = TRUE) %>%
+  dplyr::slice_head(n = 10) %>%
+  dplyr::mutate(rank = dplyr::row_number()) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(
+    region,
+    rank,
+    gene,
+    avg_log2FC,
+    pct.1,
+    pct.2,
+    p_val_adj
+  )
+
+write.csv(
+  top_deg_per_region,
+  file.path(output_dir,"Table_S7_top10_DEGs_per_region.csv"),
+  row.names = FALSE
+)
+
+# 5. Shared DEG table (fixed logic)
+shared_deg_table <- degs_sig_export %>%
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(
+    n_regions_sig = dplyr::n_distinct(region),
+    regions = paste(sort(unique(region)), collapse = ";"),
+    max_abs_log2FC = max(abs(avg_log2FC), na.rm = TRUE),
+    min_padj = min(p_val_adj, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(n_regions_sig > 1) %>%
+  dplyr::arrange(dplyr::desc(n_regions_sig), min_padj)
+
+write.csv(
+  shared_deg_table,
+  file.path(output_dir,"Table_S8_shared_DEGs_across_regions.csv"),
+  row.names = FALSE
+)
+```

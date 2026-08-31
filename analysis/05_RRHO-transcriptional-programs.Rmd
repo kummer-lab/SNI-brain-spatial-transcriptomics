@@ -1,0 +1,1877 @@
+---
+title: "10X Visium - RRHO transcriptional programs"
+output: html_notebook
+---
+
+```{r}
+### REGIONAL RRHO TRANSCRIPTIONAL-PROGRAM NETWORK
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(igraph)
+library(ggraph)
+library(ggrepel)
+library(scales)
+library(RedRibbon)
+```
+
+```{r}
+### SETTINGS
+
+output_dir <- "05_regional_RRHO_network"
+
+rrho_map_dir <- file.path(
+  output_dir,
+  "pairwise_RRHO_maps"
+)
+
+rrho_object_dir <- file.path(
+  output_dir,
+  "pairwise_RRHO_objects"
+)
+
+go_table_dir <- file.path(
+  output_dir,
+  "leading_edge_GO_tables"
+)
+
+go_plot_dir <- file.path(
+  output_dir,
+  "leading_edge_GO_plots"
+)
+
+
+dir.create(
+  output_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+dir.create(
+  rrho_map_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+dir.create(
+  rrho_object_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+dir.create(
+  go_table_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+dir.create(
+  go_plot_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+
+target_regions <- c(
+  "dSTRr",
+  "NAS",
+  "PIRc",
+  "dSTRc",
+  "S1c"
+)
+
+
+# A gene must be detected in at least 10% of spots in either
+# condition in at least two target regions.
+
+minimum_pct <- 0.10
+minimum_regions_expressed <- 2L
+
+
+# Permutation-adjusted quadrant statistics are used to mark
+# supported edges in the network.
+
+run_permutations <- TRUE
+permutation_support_cutoff <- 0.05
+
+
+# Setting the seed makes the evolutionary search reproducible.
+
+rrho_seed <- 27072026L
+
+
+# Run GO enrichment on the RRHO leading-edge genes.
+
+run_go_enrichment <- TRUE
+
+go_adjusted_p_cutoff <- 0.05
+go_min_genes <- 10L
+go_top_terms_per_set <- 10L
+
+```
+
+```{r}
+### CHECK REQUIRED INPUT
+
+required_columns <- c(
+  "gene",
+  "region",
+  "avg_log2FC",
+  "pct.1",
+  "pct.2"
+)
+
+
+missing_columns <- setdiff(
+  required_columns,
+  colnames(deg_table_all)
+)
+
+
+if (length(missing_columns) > 0) {
+
+  stop(
+    paste0(
+      "deg_table_all is missing: ",
+      paste(
+        missing_columns,
+        collapse = ", "
+      )
+    )
+  )
+}
+
+
+if (
+  !"p_val" %in% colnames(deg_table_all) &&
+  !"p_val_adj" %in% colnames(deg_table_all)
+) {
+
+  stop(
+    "deg_table_all must contain p_val or p_val_adj."
+  )
+}
+
+
+missing_regions <- setdiff(
+  target_regions,
+  unique(
+    as.character(
+      deg_table_all$region
+    )
+  )
+)
+
+
+if (length(missing_regions) > 0) {
+
+  stop(
+    paste0(
+      "The following target regions are absent: ",
+      paste(
+        missing_regions,
+        collapse = ", "
+      )
+    )
+  )
+}
+```
+
+```{r}
+### CHOOSE THE P-VALUE USED FOR RANKING
+
+# Raw p-values retain more ranking resolution and are therefore
+# used when available.
+# Adjusted p-values are used only as a fallback.
+
+if ("p_val" %in% colnames(deg_table_all)) {
+
+  ranking_p_column <- "p_val"
+
+} else {
+
+  ranking_p_column <- "p_val_adj"
+
+  warning(
+    paste0(
+      "p_val was not found. ",
+      "RRHO ranking will use p_val_adj."
+    )
+  )
+}
+
+
+cat(
+  "P-value column used for RRHO ranking:",
+  ranking_p_column,
+  "\n"
+)
+
+
+```
+
+```{r}
+### PREPARE ONE ROW PER GENE AND REGION
+
+deg_rrho <- deg_table_all %>%
+  mutate(
+    gene = trimws(
+      as.character(gene)
+    ),
+    region = as.character(region),
+    avg_log2FC = as.numeric(avg_log2FC),
+    pct.1 = as.numeric(pct.1),
+    pct.2 = as.numeric(pct.2),
+    p_for_rank = as.numeric(
+      .data[[ranking_p_column]]
+    )
+  ) %>%
+  filter(
+    region %in% target_regions,
+    !is.na(gene),
+    gene != ""
+  ) %>%
+
+  # If duplicate gene-region rows exist, retain the row with
+  # the smallest ranking p-value.
+
+  group_by(
+    gene,
+    region
+  ) %>%
+  arrange(
+    is.na(p_for_rank),
+    p_for_rank,
+    .by_group = TRUE
+  ) %>%
+  slice_head(
+    n = 1
+  ) %>%
+  ungroup() %>%
+
+  mutate(
+    maximum_pct = case_when(
+      is.na(pct.1) & is.na(pct.2) ~ NA_real_,
+      TRUE ~ pmax(
+        pct.1,
+        pct.2,
+        na.rm = TRUE
+      )
+    ),
+
+    sufficiently_expressed =
+      !is.na(maximum_pct) &
+      maximum_pct >= minimum_pct
+  )
+
+```
+
+```{r}
+### REPLACE ZERO P-VALUES SAFELY
+
+positive_p_values <- deg_rrho$p_for_rank[
+  is.finite(
+    deg_rrho$p_for_rank
+  ) &
+  deg_rrho$p_for_rank > 0
+]
+
+
+if (length(positive_p_values) == 0) {
+
+  stop(
+    "No finite positive p-values were found."
+  )
+}
+
+
+p_value_floor <- max(
+  min(
+    positive_p_values,
+    na.rm = TRUE
+  ) / 10,
+  1e-300
+)
+
+
+deg_rrho <- deg_rrho %>%
+  mutate(
+    p_for_rank_safe = case_when(
+      is.na(p_for_rank)     ~ 1,
+      p_for_rank <= 0       ~ p_value_floor,
+      p_for_rank > 1        ~ 1,
+      TRUE                  ~ p_for_rank
+    ),
+
+    signed_rrho_score =
+      sign(avg_log2FC) *
+      -log10(p_for_rank_safe)
+  )
+
+
+```
+
+```{r}
+### DEFINE ONE FIXED GENE UNIVERSE
+
+# The same genes are used for every region pair.
+# This avoids pair-dependent gene universes.
+
+eligible_gene_table <- deg_rrho %>%
+  group_by(gene) %>%
+  summarise(
+    n_regions_present = n_distinct(region),
+
+    n_regions_expressed = sum(
+      sufficiently_expressed,
+      na.rm = TRUE
+    ),
+
+    complete_fold_change = all(
+      is.finite(avg_log2FC)
+    ),
+
+    complete_rrho_score = all(
+      is.finite(signed_rrho_score)
+    ),
+
+    .groups = "drop"
+  ) %>%
+  filter(
+    n_regions_present == length(target_regions),
+    n_regions_expressed >= minimum_regions_expressed,
+    complete_fold_change,
+    complete_rrho_score
+  )
+
+
+eligible_genes <- eligible_gene_table$gene
+
+
+cat(
+  "Genes in the fixed five-region RRHO universe:",
+  length(eligible_genes),
+  "\n"
+)
+
+
+if (length(eligible_genes) < 100) {
+
+  stop(
+    paste0(
+      "Only ",
+      length(eligible_genes),
+      " genes passed the RRHO filters."
+    )
+  )
+}
+
+
+write.csv(
+  eligible_gene_table,
+  file.path(
+    output_dir,
+    "RRHO_fixed_gene_universe.csv"
+  ),
+  row.names = FALSE
+)
+
+```
+
+```{r}
+### CONSTRUCT GENE-BY-REGION RRHO SCORE MATRIX
+
+rrho_score_table <- deg_rrho %>%
+  filter(
+    gene %in% eligible_genes
+  ) %>%
+  dplyr::select(
+    gene,
+    region,
+    signed_rrho_score
+  ) %>%
+  pivot_wider(
+    names_from = region,
+    values_from = signed_rrho_score
+  )
+
+
+rrho_score_table <- rrho_score_table %>%
+  dplyr::select(
+    gene,
+    all_of(target_regions)
+  )
+
+
+write.csv(
+  rrho_score_table,
+  file.path(
+    output_dir,
+    "regional_signed_RRHO_score_matrix.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+### HELPER FUNCTIONS
+
+safe_scalar <- function(
+  x,
+  default = NA_real_
+) {
+
+  if (
+    is.null(x) ||
+    length(x) == 0 ||
+    !is.finite(as.numeric(x)[1])
+  ) {
+
+    return(default)
+  }
+
+  as.numeric(x)[1]
+}
+
+
+extract_quadrant_statistics <- function(
+  quadrant_object,
+  quadrant_name
+) {
+
+  p_value <- safe_scalar(
+    quadrant_object$pvalue
+  )
+
+  adjusted_p_value <- safe_scalar(
+    quadrant_object$padj
+  )
+
+  log_p_value <- safe_scalar(
+    quadrant_object$log_pvalue
+  )
+
+  log_adjusted_p_value <- safe_scalar(
+    quadrant_object$log_padj
+  )
+
+
+  # RedRibbon reports natural-log significance.
+
+  log10_p_value <- if (
+    is.finite(log_p_value)
+  ) {
+
+    log_p_value / log(10)
+
+  } else if (
+    is.finite(p_value) &&
+    p_value > 0
+  ) {
+
+    -log10(p_value)
+
+  } else {
+
+    NA_real_
+  }
+
+
+  log10_adjusted_p_value <- if (
+    is.finite(log_adjusted_p_value)
+  ) {
+
+    log_adjusted_p_value / log(10)
+
+  } else if (
+    is.finite(adjusted_p_value) &&
+    adjusted_p_value > 0
+  ) {
+
+    -log10(adjusted_p_value)
+
+  } else {
+
+    NA_real_
+  }
+
+
+  enrichment_direction <- safe_scalar(
+    quadrant_object$direction
+  )
+
+
+  # Positive direction indicates enrichment.
+  # Negative direction indicates depletion.
+
+  enrichment_strength <- if (
+    is.finite(enrichment_direction) &&
+    enrichment_direction > 0 &&
+    is.finite(log10_p_value)
+  ) {
+
+    log10_p_value
+
+  } else {
+
+    0
+  }
+
+
+  tibble(
+    quadrant = quadrant_name,
+    p_value = p_value,
+    adjusted_p_value = adjusted_p_value,
+    log10_p_value = log10_p_value,
+    log10_adjusted_p_value =
+      log10_adjusted_p_value,
+    enrichment_direction =
+      enrichment_direction,
+    overlap_count = safe_scalar(
+      quadrant_object$count,
+      default = 0
+    ),
+    enrichment_strength =
+      enrichment_strength
+  )
+}
+
+
+minimum_finite <- function(x) {
+
+  x <- x[
+    is.finite(x)
+  ]
+
+  if (length(x) == 0) {
+
+    return(NA_real_)
+  }
+
+  min(x)
+}
+
+
+sanitize_filename <- function(x) {
+
+  gsub(
+    "[^A-Za-z0-9_-]+",
+    "_",
+    x
+  )
+}
+
+```
+
+```{r}
+### DEFINE ALL TEN REGION PAIRS
+
+region_pairs <- t(
+  combn(
+    target_regions,
+    2
+  )
+)
+
+
+pair_summary_list <- vector(
+  mode = "list",
+  length = nrow(region_pairs)
+)
+
+
+quadrant_summary_list <- vector(
+  mode = "list",
+  length = nrow(region_pairs)
+)
+
+
+leading_edge_list <- vector(
+  mode = "list",
+  length = nrow(region_pairs) * 4
+)
+
+
+leading_edge_index <- 1L
+
+```
+
+```{r}
+### RUN ALL PAIRWISE REDRIBBON ANALYSES
+
+for (
+  pair_index in seq_len(
+    nrow(region_pairs)
+  )
+) {
+
+  region_1 <- region_pairs[
+    pair_index,
+    1
+  ]
+
+  region_2 <- region_pairs[
+    pair_index,
+    2
+  ]
+
+
+  pair_id <- paste0(
+    region_1,
+    "_vs_",
+    region_2
+  )
+
+
+  cat(
+    "\nRunning RRHO:",
+    pair_id,
+    "\n"
+  )
+
+
+  pair_input <- data.frame(
+    id = rrho_score_table$gene,
+    a = rrho_score_table[[region_1]],
+    b = rrho_score_table[[region_2]],
+    stringsAsFactors = FALSE
+  )
+
+
+  if (
+    any(!is.finite(pair_input$a)) ||
+    any(!is.finite(pair_input$b))
+  ) {
+
+    stop(
+      paste0(
+        "Non-finite RRHO score detected for ",
+        pair_id
+      )
+    )
+  }
+
+
+  set.seed(
+    rrho_seed + pair_index
+  )
+
+
+  rrho_object <- RedRibbon::RedRibbon(
+    pair_input,
+    enrichment_mode = "hyper-two-tailed"
+  )
+
+
+  quadrant_object <- RedRibbon::quadrants(
+    rrho_object,
+    algorithm = "ea",
+    permutation = run_permutations,
+    whole = FALSE
+  )
+
+
+  saveRDS(
+    list(
+      input = pair_input,
+      rrho = rrho_object,
+      quadrants = quadrant_object
+    ),
+    file.path(
+      rrho_object_dir,
+      paste0(
+        pair_id,
+        "_RedRibbon_object.rds"
+      )
+    )
+  )
+  
+  # Save RRHO Map
+  
+    rrho_plot <- RedRibbon::ggRedRibbon(
+    rrho_object,
+    quadrants = quadrant_object,
+    labels = c(
+      region_1,
+      region_2
+    ),
+    repel.force = 250
+  ) +
+    coord_fixed(
+      ratio = 1,
+      clip = "off"
+    ) +
+    labs(
+      title = paste0(
+        "Rank-rank hypergeometric overlap: ",
+        region_1,
+        " vs ",
+        region_2
+      ),
+      subtitle = paste0(
+        "Ranking: -log10(",
+        ranking_p_column,
+        ") × sign(log2FC)"
+      )
+    ) +
+    theme(
+      plot.title = element_text(
+        face = "bold"
+      )
+    )
+
+
+  ggsave(
+    filename = file.path(
+      rrho_map_dir,
+      paste0(
+        pair_id,
+        "_RRHO_map.pdf"
+      )
+    ),
+    plot = rrho_plot,
+    device = cairo_pdf,
+    width = 8,
+    height = 7,
+    units = "in"
+  )
+
+
+  ggsave(
+    filename = file.path(
+      rrho_map_dir,
+      paste0(
+        pair_id,
+        "_RRHO_map.png"
+      )
+    ),
+    plot = rrho_plot,
+    width = 8,
+    height = 7,
+    units = "in",
+    dpi = 300
+  )
+
+  
+  # Extract quadrant statistics
+  
+  quadrant_statistics <- bind_rows(
+    extract_quadrant_statistics(
+      quadrant_object$upup,
+      "upup"
+    ),
+
+    extract_quadrant_statistics(
+      quadrant_object$downdown,
+      "downdown"
+    ),
+
+    extract_quadrant_statistics(
+      quadrant_object$updown,
+      "updown"
+    ),
+
+    extract_quadrant_statistics(
+      quadrant_object$downup,
+      "downup"
+    )
+  ) %>%
+    mutate(
+      region_1 = region_1,
+      region_2 = region_2,
+      pair_id = pair_id,
+      .before = 1
+    )
+
+
+  quadrant_summary_list[[
+    pair_index
+  ]] <- quadrant_statistics
+
+  
+  # Extract leading-edge genes
+  
+  quadrant_names <- c(
+    "upup",
+    "downdown",
+    "updown",
+    "downup"
+  )
+
+
+  for (
+    quadrant_name in quadrant_names
+  ) {
+
+    current_quadrant <-
+      quadrant_object[[quadrant_name]]
+
+
+    current_positions <-
+      current_quadrant$positions
+
+
+    if (
+      is.null(current_positions) ||
+      length(current_positions) == 0
+    ) {
+
+      next
+    }
+
+
+    current_positions <- unique(
+      as.integer(current_positions)
+    )
+
+
+    current_positions <- current_positions[
+      current_positions >= 1 &
+      current_positions <= nrow(pair_input)
+    ]
+
+
+    if (length(current_positions) == 0) {
+
+      next
+    }
+
+
+    current_statistics <-
+      quadrant_statistics %>%
+      filter(
+        quadrant == quadrant_name
+      )
+
+
+    leading_edge_list[[
+      leading_edge_index
+    ]] <- pair_input[
+      current_positions,
+      ,
+      drop = FALSE
+    ] %>%
+      as_tibble() %>%
+      transmute(
+        pair_id = pair_id,
+        region_1 = region_1,
+        region_2 = region_2,
+        quadrant = quadrant_name,
+        gene = id,
+        score_region_1 = a,
+        score_region_2 = b,
+
+        quadrant_p_value =
+          current_statistics$p_value,
+
+        quadrant_adjusted_p_value =
+          current_statistics$adjusted_p_value,
+
+        quadrant_log10_p_value =
+          current_statistics$log10_p_value,
+
+        enrichment_direction =
+          current_statistics$enrichment_direction
+      )
+
+
+    leading_edge_index <-
+      leading_edge_index + 1L
+  }
+
+  # Summarize the pair for network construction
+  
+  upup_stats <- quadrant_statistics %>%
+    filter(
+      quadrant == "upup"
+    )
+
+  downdown_stats <- quadrant_statistics %>%
+    filter(
+      quadrant == "downdown"
+    )
+
+  updown_stats <- quadrant_statistics %>%
+    filter(
+      quadrant == "updown"
+    )
+
+  downup_stats <- quadrant_statistics %>%
+    filter(
+      quadrant == "downup"
+    )
+
+
+  upup_strength <-
+    upup_stats$enrichment_strength
+
+  downdown_strength <-
+    downdown_stats$enrichment_strength
+
+  updown_strength <-
+    updown_stats$enrichment_strength
+
+  downup_strength <-
+    downup_stats$enrichment_strength
+
+
+  concordant_strength <- max(
+    upup_strength,
+    downdown_strength,
+    na.rm = TRUE
+  )
+
+
+  discordant_strength <- max(
+    updown_strength,
+    downup_strength,
+    na.rm = TRUE
+  )
+
+
+  direction_denominator <-
+    upup_strength +
+    downdown_strength
+
+
+  direction_balance <- if (
+    is.finite(direction_denominator) &&
+    direction_denominator > 0
+  ) {
+
+    (
+      upup_strength -
+      downdown_strength
+    ) /
+    direction_denominator
+
+  } else {
+
+    0
+  }
+
+
+  relationship_type <- if (
+    concordant_strength >=
+    discordant_strength
+  ) {
+
+    "Concordant"
+
+  } else {
+
+    "Discordant"
+  }
+
+
+  dominant_concordant_direction <- case_when(
+    upup_strength >
+      downdown_strength ~ "Up/up",
+
+    downdown_strength >
+      upup_strength ~ "Down/down",
+
+    TRUE ~ "Balanced"
+  )
+
+
+  concordant_adjusted_p <- minimum_finite(
+    c(
+      if (
+        upup_stats$enrichment_direction > 0
+      ) {
+        upup_stats$adjusted_p_value
+      } else {
+        NA_real_
+      },
+
+      if (
+        downdown_stats$enrichment_direction > 0
+      ) {
+        downdown_stats$adjusted_p_value
+      } else {
+        NA_real_
+      }
+    )
+  )
+
+
+  concordant_raw_p <- minimum_finite(
+    c(
+      if (
+        upup_stats$enrichment_direction > 0
+      ) {
+        upup_stats$p_value
+      } else {
+        NA_real_
+      },
+
+      if (
+        downdown_stats$enrichment_direction > 0
+      ) {
+        downdown_stats$p_value
+      } else {
+        NA_real_
+      }
+    )
+  )
+
+
+  supported <- if (
+    is.finite(concordant_adjusted_p)
+  ) {
+
+    concordant_adjusted_p <
+      permutation_support_cutoff
+
+  } else if (
+    is.finite(concordant_raw_p)
+  ) {
+
+    concordant_raw_p <
+      permutation_support_cutoff
+
+  } else {
+
+    FALSE
+  }
+
+
+  pair_summary_list[[
+    pair_index
+  ]] <- tibble(
+    region_1 = region_1,
+    region_2 = region_2,
+    pair_id = pair_id,
+
+    upup_strength = upup_strength,
+    downdown_strength =
+      downdown_strength,
+
+    updown_strength =
+      updown_strength,
+    downup_strength =
+      downup_strength,
+
+    concordant_strength =
+      concordant_strength,
+
+    discordant_strength =
+      discordant_strength,
+
+    direction_balance =
+      direction_balance,
+
+    relationship_type =
+      relationship_type,
+
+    dominant_concordant_direction =
+      dominant_concordant_direction,
+
+    concordant_raw_p =
+      concordant_raw_p,
+
+    concordant_adjusted_p =
+      concordant_adjusted_p,
+
+    supported = supported,
+
+    upup_overlap_count =
+      upup_stats$overlap_count,
+
+    downdown_overlap_count =
+      downdown_stats$overlap_count,
+
+    updown_overlap_count =
+      updown_stats$overlap_count,
+
+    downup_overlap_count =
+      downup_stats$overlap_count
+  )
+}
+
+```
+
+```{r}
+### COMBINE AND EXPORT RRHO RESULTS
+
+pairwise_rrho_summary <- bind_rows(
+  pair_summary_list
+) %>%
+  arrange(
+    desc(concordant_strength)
+  )
+
+
+quadrant_rrho_summary <- bind_rows(
+  quadrant_summary_list
+) %>%
+  arrange(
+    pair_id,
+    quadrant
+  )
+
+
+leading_edge_genes <- bind_rows(
+  leading_edge_list
+) %>%
+  distinct(
+    pair_id,
+    quadrant,
+    gene,
+    .keep_all = TRUE
+  )
+
+
+write.csv(
+  pairwise_rrho_summary,
+  file.path(
+    output_dir,
+    "regional_pairwise_RRHO_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  quadrant_rrho_summary,
+  file.path(
+    output_dir,
+    "regional_RRHO_quadrant_statistics.csv"
+  ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  leading_edge_genes,
+  file.path(
+    output_dir,
+    "regional_RRHO_leading_edge_genes.csv"
+  ),
+  row.names = FALSE
+)
+
+
+cat(
+  "\nPairwise RRHO summary:\n"
+)
+
+print(
+  pairwise_rrho_summary
+)
+
+```
+
+```{r}
+### CONSTRUCT COMPLETE REGIONAL RRHO NETWORK
+
+# All ten pairwise edges are retained.
+# No edge threshold and no forced module assignment are used.
+
+network_edges <- pairwise_rrho_summary %>%
+  transmute(
+    from = region_1,
+    to = region_2,
+
+    concordant_strength =
+      concordant_strength,
+
+    discordant_strength =
+      discordant_strength,
+
+    direction_balance =
+      direction_balance,
+
+    relationship_type =
+      relationship_type,
+
+    dominant_concordant_direction =
+      dominant_concordant_direction,
+
+    supported = factor(
+      supported,
+      levels = c(
+        FALSE,
+        TRUE
+      )
+    ),
+
+    concordant_adjusted_p =
+      concordant_adjusted_p,
+
+    edge_width_value = pmax(
+      concordant_strength,
+      1e-6
+    )
+  )
+
+
+# Nodes deliberately have no quantitative size encoding.
+
+node_table <- tibble(
+  name = target_regions
+)
+
+
+regional_graph <- graph_from_data_frame(
+  d = network_edges,
+  directed = FALSE,
+  vertices = node_table
+)
+
+
+# Fixed circular layout.
+# Node position has no quantitative interpretation.
+
+network_angles <- seq(
+  pi / 2,
+  pi / 2 - 2 * pi,
+  length.out = length(target_regions) + 1
+)[
+  seq_along(target_regions)
+]
+
+
+network_layout <- tibble(
+  name = target_regions,
+  x = cos(network_angles),
+  y = sin(network_angles)
+)
+
+
+vertex_order <- V(regional_graph)$name
+
+
+layout_x <- network_layout$x[
+  match(
+    vertex_order,
+    network_layout$name
+  )
+]
+
+
+layout_y <- network_layout$y[
+  match(
+    vertex_order,
+    network_layout$name
+  )
+]
+
+
+rrho_network_plot <- ggraph(
+  regional_graph,
+  layout = "manual",
+  x = layout_x,
+  y = layout_y
+) +
+
+  geom_edge_link(
+    aes(
+      width = edge_width_value,
+      colour = direction_balance,
+      alpha = supported,
+      linetype = relationship_type
+    ),
+    lineend = "round"
+  ) +
+
+  geom_node_point(
+    size = 13,
+    shape = 21,
+    fill = "white",
+    colour = "black",
+    stroke = 1
+  ) +
+
+  geom_node_text(
+    aes(
+      label = name
+    ),
+    repel = TRUE,
+    size = 5,
+    fontface = "bold"
+  ) +
+
+  scale_edge_width_continuous(
+    name = "Concordant RRHO\nstrength (-log10 p)",
+    range = c(
+      0.5,
+      5
+    ),
+    trans = "sqrt"
+  ) +
+
+  scale_edge_colour_gradient2(
+    name = "Direction of\nconcordant overlap",
+    low = "#2166ac",
+    mid = "grey85",
+    high = "#b2182b",
+    midpoint = 0,
+    limits = c(
+      -0.3,
+      0.3
+    ),
+    breaks = c(
+      -0.3,
+      0,
+      0.3
+    ),
+    labels = c(
+      "Down/down",
+      "Balanced",
+      "Up/up"
+    )
+  ) +
+
+  scale_edge_alpha_manual(
+    name = "Permutation-adjusted\nsupport",
+    values = c(
+      `FALSE` = 0.25,
+      `TRUE` = 0.90
+    ),
+    labels = c(
+      `FALSE` = paste0(
+        "padj ≥ ",
+        permutation_support_cutoff
+      ),
+      `TRUE` = paste0(
+        "padj < ",
+        permutation_support_cutoff
+      )
+    )
+  ) +
+
+  scale_edge_linetype_manual(
+    name = "Dominant relationship",
+    values = c(
+      Concordant = "solid",
+      Discordant = "dashed"
+    )
+  ) +
+
+  coord_equal(
+    clip = "off"
+  ) +
+
+  labs(
+    title = "Regional shared-transcriptional-program network",
+    subtitle = paste0(
+      "RRHO of ranked SNI-versus-sham responses; ",
+      "all ten regional relationships shown"
+    )
+  ) +
+
+  theme_void() +
+
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 15
+    ),
+
+    plot.subtitle = element_text(
+      size = 10
+    ),
+
+    plot.margin = margin(
+      25,
+      40,
+      25,
+      40
+    ),
+
+    legend.position = "right"
+  )
+
+
+ggsave(
+  filename = file.path(
+    output_dir,
+    "regional_RRHO_shared_program_network.pdf"
+  ),
+  plot = rrho_network_plot,
+  device = cairo_pdf,
+  width = 11,
+  height = 8,
+  units = "in"
+)
+
+
+ggsave(
+  filename = file.path(
+    output_dir,
+    "regional_RRHO_shared_program_network.png"
+  ),
+  plot = rrho_network_plot,
+  width = 11,
+  height = 8,
+  units = "in",
+  dpi = 300
+)
+
+write.csv(
+  network_edges,
+  file.path(
+    output_dir,
+    "regional_RRHO_network_edges.csv"
+  ),
+  row.names = FALSE
+)
+
+```
+
+```{r}
+### GO-BP ENRICHMENT OF CONCORDANT LEADING-EDGE GENES
+
+if (run_go_enrichment) {
+
+  if (
+    !requireNamespace(
+      "clusterProfiler",
+      quietly = TRUE
+    )
+  ) {
+
+    stop(
+      paste0(
+        "clusterProfiler is required because ",
+        "run_go_enrichment = TRUE."
+      )
+    )
+  }
+
+
+  if (
+    !requireNamespace(
+      "org.Mm.eg.db",
+      quietly = TRUE
+    )
+  ) {
+
+    stop(
+      paste0(
+        "org.Mm.eg.db is required because ",
+        "run_go_enrichment = TRUE."
+      )
+    )
+  }
+
+
+  concordant_leading_edges <- leading_edge_genes %>%
+    filter(
+      quadrant %in% c(
+        "upup",
+        "downdown"
+      ),
+      enrichment_direction > 0
+    )
+
+
+  enrichment_groups <- concordant_leading_edges %>%
+    group_by(
+      pair_id,
+      region_1,
+      region_2,
+      quadrant
+    ) %>%
+    summarise(
+      genes = list(
+        unique(gene)
+      ),
+      n_genes = n_distinct(gene),
+      .groups = "drop"
+    )
+
+
+  enrichment_result_list <- vector(
+    mode = "list",
+    length = nrow(enrichment_groups)
+  )
+
+
+  for (
+    enrichment_index in seq_len(
+      nrow(enrichment_groups)
+    )
+  ) {
+
+    current_group <-
+      enrichment_groups[
+        enrichment_index,
+      ]
+
+
+    current_genes <-
+      current_group$genes[[1]]
+
+
+    if (
+      length(current_genes) <
+      go_min_genes
+    ) {
+
+      next
+    }
+
+
+    current_enrichment <-
+      clusterProfiler::enrichGO(
+        gene = current_genes,
+
+        universe = eligible_genes,
+
+        OrgDb =
+          org.Mm.eg.db::org.Mm.eg.db,
+
+        keyType = "SYMBOL",
+
+        ont = "BP",
+
+        pAdjustMethod = "BH",
+
+        pvalueCutoff = 1,
+
+        qvalueCutoff = 1,
+
+        minGSSize = 10,
+
+        maxGSSize = 500,
+
+        readable = TRUE
+      )
+
+
+    current_enrichment_df <-
+      as.data.frame(
+        current_enrichment
+      )
+
+
+    if (
+      nrow(current_enrichment_df) == 0
+    ) {
+
+      next
+    }
+
+
+    current_enrichment_df <-
+      current_enrichment_df %>%
+      mutate(
+        pair_id =
+          current_group$pair_id,
+
+        region_1 =
+          current_group$region_1,
+
+        region_2 =
+          current_group$region_2,
+
+        quadrant =
+          current_group$quadrant,
+
+        n_leading_edge_genes =
+          current_group$n_genes,
+
+        .before = 1
+      )
+
+
+    enrichment_result_list[[
+      enrichment_index
+    ]] <- current_enrichment_df
+
+
+    current_output_name <- paste0(
+      current_group$pair_id,
+      "_",
+      current_group$quadrant
+    )
+
+
+    write.csv(
+      current_enrichment_df,
+      file.path(
+        go_table_dir,
+        paste0(
+          sanitize_filename(
+            current_output_name
+          ),
+          "_GO_BP.csv"
+        )
+      ),
+      row.names = FALSE
+    )
+
+
+  }  # closes the enrichment for-loop
+
+
+  all_leading_edge_go <- bind_rows(
+    enrichment_result_list
+  )
+
+
+  write.csv(
+    all_leading_edge_go,
+    file.path(
+      output_dir,
+      "all_RRHO_leading_edge_GO_BP_results.csv"
+    ),
+    row.names = FALSE
+  )
+
+
+
+  # Individual GO plots with global fixed scales
+
+
+  all_plot_df <- all_leading_edge_go %>%
+    filter(
+      !is.na(p.adjust),
+      p.adjust < go_adjusted_p_cutoff
+    ) %>%
+
+    group_by(
+      pair_id,
+      region_1,
+      region_2,
+      quadrant
+    ) %>%
+
+    arrange(
+      p.adjust,
+      .by_group = TRUE
+    ) %>%
+
+    slice_head(
+      n = go_top_terms_per_set
+    ) %>%
+
+    ungroup() %>%
+
+    mutate(
+      GeneRatio_numeric = vapply(
+        strsplit(
+          GeneRatio,
+          "/"
+        ),
+        function(x) {
+          as.numeric(x[1]) /
+            as.numeric(x[2])
+        },
+        numeric(1)
+      ),
+
+      minus_log10_padj = -log10(
+        pmax(
+          p.adjust,
+          1e-300
+        )
+      )
+    )
+
+
+  if (
+    nrow(all_plot_df) > 0
+  ) {
+
+    # Global limits used identically in every plot
+
+    global_gene_ratio_max <- max(
+      all_plot_df$GeneRatio_numeric,
+      na.rm = TRUE
+    )
+
+
+    global_colour_limits <- range(
+      all_plot_df$minus_log10_padj,
+      na.rm = TRUE
+    )
+
+
+    if (
+      diff(global_colour_limits) == 0
+    ) {
+
+      global_colour_limits <-
+        global_colour_limits +
+        c(
+          -0.5,
+          0.5
+        )
+    }
+
+
+    plot_groups <- all_plot_df %>%
+      distinct(
+        pair_id,
+        region_1,
+        region_2,
+        quadrant,
+        n_leading_edge_genes
+      )
+
+
+    for (
+      plot_index in seq_len(
+        nrow(plot_groups)
+      )
+    ) {
+
+      current_group <-
+        plot_groups[
+          plot_index,
+        ]
+
+
+      current_plot_df <- all_plot_df %>%
+        filter(
+          pair_id ==
+            current_group$pair_id,
+
+          quadrant ==
+            current_group$quadrant
+        ) %>%
+
+        arrange(
+          p.adjust
+        ) %>%
+
+        mutate(
+          Description = factor(
+            Description,
+            levels = rev(
+              unique(
+                Description
+              )
+            )
+          )
+        )
+
+
+      current_output_name <- paste0(
+        current_group$pair_id,
+        "_",
+        current_group$quadrant
+      )
+
+
+      current_direction_label <- ifelse(
+        current_group$quadrant == "upup",
+        "shared upregulated program",
+        "shared downregulated program"
+      )
+
+
+      go_plot <- ggplot(
+        current_plot_df,
+        aes(
+          x = 1,
+          y = Description
+        )
+      ) +
+
+        geom_point(
+          aes(
+            size = GeneRatio_numeric,
+            colour = minus_log10_padj
+          )
+        ) +
+
+        scale_size_area(
+          name = "Gene ratio",
+          max_size = 10,
+          limits = c(
+            0,
+            global_gene_ratio_max
+          ),
+          breaks = scales::breaks_pretty(
+            n = 4
+          ),
+          labels = scales::percent_format(
+            accuracy = 1
+          )
+        ) +
+
+        scale_colour_gradient(
+          low = "#fcbba1",
+          high = "#67000d",
+          name = "-log10\nadjusted p",
+          limits = global_colour_limits,
+          breaks = scales::breaks_pretty(
+            n = 4
+          ),
+          oob = scales::squish
+        ) +
+
+        scale_x_continuous(
+          breaks = NULL
+        ) +
+
+        labs(
+          title = paste0(
+            current_group$region_1,
+            "–",
+            current_group$region_2,
+            ": ",
+            current_direction_label
+          ),
+
+          subtitle = paste0(
+            current_group$n_leading_edge_genes,
+            " RRHO overlap genes"
+          ),
+
+          x = NULL,
+          y = NULL
+        ) +
+
+        theme_bw() +
+
+        theme(
+          panel.grid =
+            element_blank(),
+
+          plot.title =
+            element_text(
+              face = "bold"
+            ),
+
+          axis.text.x =
+            element_blank(),
+
+          axis.ticks.x =
+            element_blank(),
+
+          axis.text.y =
+            element_text(
+              size = 8
+            )
+        )
+
+
+      ggsave(
+        filename = file.path(
+          go_plot_dir,
+          paste0(
+            sanitize_filename(
+              current_output_name
+            ),
+            "_GO_BP_dotplot.pdf"
+          )
+        ),
+        plot = go_plot,
+        device = cairo_pdf,
+        width = 7,
+        height = 6,
+        units = "in"
+      )
+    }
+  }
+}  # end GO enrichment
+```
+
