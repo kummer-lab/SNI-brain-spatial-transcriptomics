@@ -1,3 +1,7 @@
+# This script integrates raw data from 4 Spatial Slides
+# This script requires large RAM resources
+# This script was therefore executed on an HPC of Medical University Innsbruck
+
 library(Seurat)
 library(ggplot2)
 library(tibble)
@@ -11,7 +15,6 @@ library("pheatmap")
 library(DESeq2)
 library(clusterProfiler)
 library(org.Mm.eg.db)
-
 library(scater)
 library(Seurat)
 library(tidyverse)
@@ -36,7 +39,8 @@ library(data.table)
 set.seed(7)
 
 # load the data
-##################################meta_1 = metadata("Metadata_sham_KK3.csv",sham_data_1)
+##################################
+#meta_1 = metadata("Metadata_sham_KK3.csv",sham_data_1)
 #sham_data_1@meta.data = meta_1############
 
 metadata <- function(path, experiment){
@@ -51,6 +55,7 @@ metadata <- function(path, experiment){
   new_meta <- new_meta[ix,]
   return(new_meta)
 }
+
 ################################################
 
 setwd("~/storage/spatial_transcriptomics/sni_visum_brain/spaceranger/")
@@ -155,8 +160,8 @@ sni_data_2$batch <- "Batch3"
 sham_data_2$condition <- "sham"
 sham_data_2$batch <- "Batch4"
 
-#####################################################################library(Seurat)
-library(ggplot2)
+
+#####################################################################
 sni_data_1 <- subset(sni_data_1, nCount_Spatial>0)
 sham_data_1 <- subset(sham_data_1, nCount_Spatial>0)
 sni_data_2 <- subset(sni_data_2, nCount_Spatial>0)
@@ -176,6 +181,26 @@ experiment.anchors <- FindIntegrationAnchors(object.list = experiment, normaliza
                                              anchor.features = experiment.features, verbose = TRUE, dims = 1:30)
 experiment.integrated <- IntegrateData(anchorset = experiment.anchors, normalization.method = "SCT", 
                                        verbose = TRUE, dims = 1:30)
+
+
+
+########################################################################
+# label transfer
+########################################################################
+DefaultAssay(experiment) <- "Spatial"
+
+experiment = NormalizeData(experiment) %>% 
+  ScaleData()
+markers = FindAllMarkers(experiment)
+Idents(experiment) = experiment@meta.data$label
+markers_per_region = FindAllMarkers(experiment)
+
+
+#save.image(file = "../data_analysis/dz_Visum_Pain.RData")
+save.image(file = "../data_analysis/Visum_Pain.RData")
+
+
+##### Pre-Analysis checks 
 
 # set the assay to an integrated analysis 
 DefaultAssay(experiment.integrated) <- "integrated"
@@ -215,20 +240,6 @@ seurat_cluster_degs = FindAllMarkers(experiment)
 modified_degs = seurat_cluster_degs[seurat_cluster_degs$avg_log2FC>0,]
 modified_degs = modified_degs %>% group_by(cluster) %>% slice(1:2) # order(p_val_adj) %>% 
 
-## find that one gene that has positive lg2foldchange in only 1 group
-
-#for (g in unique(seurat_cluster_degs$gene)){
-#  tmp = seurat_cluster_degs[seurat_cluster_degs$gene == g,]
-#  if (length(which(tmp$avg_log2FC > 0))==1){
-#    print("success")
-#    print(g)library(Seurat)
-library(ggplot2)
-#  }
-#  modified_degs = modified_degs %>% group_by(cluster) %>% slice(1:2) # order(p_val_adj) %>% 
-#}
-
-
-
 VlnPlot(experiment, "Fos")
 FeaturePlot(experiment, "Pvalb", label = T, split.by = "batch")
 
@@ -250,18 +261,7 @@ ggplot(final_counts, aes(fill = Var2, y=freq, x=Var1, label = round(freq, 2))) +
   geom_bar(stat="identity") +  
   geom_text(size = 3, position = position_stack(vjust = 0.5))
 
-########################################################################
-# label transfer
-########################################################################
-DefaultAssay(experiment) <- "Spatial"
 
-experiment = NormalizeData(experiment) %>% 
-  ScaleData()
-markers = FindAllMarkers(experiment)
-Idents(experiment) = experiment@meta.data$label
-markers_per_region = Find
-AllMarkers(experiment)
-save.image(file = "../data_analysis/dz_Visum_Pain.RData")
 
 
 
