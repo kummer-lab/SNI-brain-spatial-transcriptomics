@@ -1,0 +1,64 @@
+---
+title: "10X Visium analysis - cleanup"
+output: html_notebook
+---
+
+
+```{r}
+rm(list = ls())
+gc()
+
+library(Seurat)
+library(dplyr)
+
+set.seed(7)
+
+#Set working directory
+
+
+#Load object
+load("Visium_Pain.RData")
+```
+
+```{r}
+### CLEANUP
+
+experiment <- subset(experiment, labels != "n/a")
+
+batch1 <- subset(experiment, batch == "Batch1")
+batch1@images <- batch1@images["SNI1"]
+
+coords <- batch1@images$SNI1@coordinates
+coords$barcode <- rownames(coords)
+coords$label <- batch1$labels[coords$barcode]
+
+acr_barcodes <- coords$barcode[(coords$row < 30) & (coords$label == "ACCr")]
+acc_barcodes <- coords$barcode[(coords$row > 40) & (coords$label == "ACCc")]
+
+experiment$labels[acr_barcodes] <- "ACr"
+experiment$labels[acc_barcodes] <- "ACc"
+
+save(experiment, file = "Visium_Pain_clean.RData")
+
+```
+
+```{r}
+
+# Load cleaned object
+load("Visium_Pain_clean.RData")  # loads 'experiment'
+
+# Basic counts
+table(experiment$labels)
+table(experiment$labels, experiment$batch)
+
+# Batch1 visual control
+batch1 <- subset(experiment, batch == "Batch1")
+batch1@images <- batch1@images["SNI1"]
+
+SpatialDimPlot(batch1, group.by = "labels", label = TRUE) + NoLegend()
+
+# Focus on corrected ACC labels
+acc_subset <- subset(batch1, labels %in% c("ACr", "ACc", "ACCr", "ACCc"))
+SpatialDimPlot(acc_subset, group.by = "labels", label = TRUE)
+```
+
